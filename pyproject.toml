@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openlinker"
+version = "0.1.0"
+description = "Official Python SDK for OpenLinker"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "OpenLinker" }]
+dependencies = [
+  "httpx>=0.27",
+  "websockets>=12",
+]
+
+[project.optional-dependencies]
+grpc = [
+  "a2a-sdk[grpc]>=1.0",
+  "grpcio>=1.62",
+  "protobuf>=4.25",
+]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "respx>=0.21",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+openlinker = "openlinker.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openlinker"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
