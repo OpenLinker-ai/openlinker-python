@@ -21,7 +21,9 @@ class WebhookRunCallbackOptions:
     event_types: list[str] | None = None
 
 
-def new_webhook_run_callback(url: str, opts: WebhookRunCallbackOptions | None = None) -> TaskCallbackConfig:
+def new_webhook_run_callback(
+    url: str, opts: WebhookRunCallbackOptions | None = None
+) -> TaskCallbackConfig:
     trimmed = url.strip()
     if not trimmed:
         raise ValueError("openlinker: task callback URL is required")
@@ -79,4 +81,3 @@ GenerateTaskCallbackSecret = generate_task_callback_secret
 SignTaskCallbackPayload = sign_task_callback_payload
 VerifyTaskCallbackSignature = verify_task_callback_signature
 TaskCallbackSignatureFromHeader = task_callback_signature_from_header
-

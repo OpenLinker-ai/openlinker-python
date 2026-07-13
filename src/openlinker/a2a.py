@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 import time
@@ -107,7 +106,9 @@ class A2ATaskPushNotificationConfig(Model):
     metadata: dict[str, Any] | None = None
     event_types: list[str] = jfield("eventTypes", default_factory=list)
     event_types_alias: list[str] = jfield("event_types", default_factory=list)
-    push_notification_config: A2APushNotificationConfig | None = jfield("pushNotificationConfig", None)
+    push_notification_config: A2APushNotificationConfig | None = jfield(
+        "pushNotificationConfig", None
+    )
 
 
 @dataclass
@@ -115,8 +116,12 @@ class A2ASendConfiguration(Model):
     accepted_output_modes: list[str] = jfield("acceptedOutputModes", default_factory=list)
     blocking: bool | None = None
     return_immediately: bool | None = jfield("returnImmediately", None)
-    push_notification_config: A2APushNotificationConfig | None = jfield("pushNotificationConfig", None)
-    task_push_notification_config: A2ATaskPushNotificationConfig | None = jfield("taskPushNotificationConfig", None)
+    push_notification_config: A2APushNotificationConfig | None = jfield(
+        "pushNotificationConfig", None
+    )
+    task_push_notification_config: A2ATaskPushNotificationConfig | None = jfield(
+        "taskPushNotificationConfig", None
+    )
     history_length: int | None = jfield("historyLength", None)
 
 
@@ -132,7 +137,9 @@ class A2ATaskPushConfigParams(Model):
     id: str | None = None
     task_id: str | None = jfield("taskId", None)
     push_notification_config_id: str | None = jfield("pushNotificationConfigId", None)
-    push_notification_config: A2APushNotificationConfig | None = jfield("pushNotificationConfig", None)
+    push_notification_config: A2APushNotificationConfig | None = jfield(
+        "pushNotificationConfig", None
+    )
     url: str | None = None
     token: str | None = None
     secret: str | None = None
@@ -287,7 +294,9 @@ class A2AClient:
         if self._owns_client:
             await self.http_client.aclose()
 
-    def _headers(self, accept: str, content_type: str = "application/json", has_body: bool = True) -> dict[str, str]:
+    def _headers(
+        self, accept: str, content_type: str = "application/json", has_body: bool = True
+    ) -> dict[str, str]:
         headers = {"Accept": accept, "X-OpenLinker-SDK": self.sdk_agent}
         if has_body:
             headers["Content-Type"] = content_type
@@ -299,7 +308,9 @@ class A2AClient:
         return headers
 
     def _method(self, method: str) -> str:
-        return A2A_LEGACY_METHODS.get(method, method) if self.dialect == A2A_DIALECT_LEGACY else method
+        return (
+            A2A_LEGACY_METHODS.get(method, method) if self.dialect == A2A_DIALECT_LEGACY else method
+        )
 
     async def call(self, method: str, params: Any = None) -> Any:
         response = await self._do_jsonrpc(method, params, "application/json")
@@ -308,7 +319,9 @@ class A2AClient:
             raise A2AJSONRPCError(err.get("code"), err.get("message", ""), err.get("data"))
         return response.get("result")
 
-    async def send_message_response(self, params: A2AMessageSendParams | dict[str, Any]) -> A2ASendMessageResponse:
+    async def send_message_response(
+        self, params: A2AMessageSendParams | dict[str, Any]
+    ) -> A2ASendMessageResponse:
         result = await self.call(A2A_METHOD_MESSAGE_SEND, maybe_model(params, A2AMessageSendParams))
         return decode_a2a_send_message_response(result)
 
@@ -317,49 +330,85 @@ class A2AClient:
         if resp.task is not None:
             return resp.task
         if resp.message is not None:
-            raise RuntimeError("openlinker: A2A SendMessage returned a message; use send_message_response")
+            raise RuntimeError(
+                "openlinker: A2A SendMessage returned a message; use send_message_response"
+            )
         raise RuntimeError("openlinker: A2A SendMessage returned an empty response")
 
-    async def stream_message(self, params: A2AMessageSendParams | dict[str, Any]) -> AsyncIterator[A2AStreamEvent]:
-        async for event in self._stream_jsonrpc(A2A_METHOD_MESSAGE_STREAM, maybe_model(params, A2AMessageSendParams)):
+    async def stream_message(
+        self, params: A2AMessageSendParams | dict[str, Any]
+    ) -> AsyncIterator[A2AStreamEvent]:
+        async for event in self._stream_jsonrpc(
+            A2A_METHOD_MESSAGE_STREAM, maybe_model(params, A2AMessageSendParams)
+        ):
             yield event
 
     async def get_task(self, params: A2ATaskQueryParams | dict[str, Any]) -> A2ATask:
-        return A2ATask.from_dict(await self.call(A2A_METHOD_TASKS_GET, maybe_model(params, A2ATaskQueryParams)))
+        return A2ATask.from_dict(
+            await self.call(A2A_METHOD_TASKS_GET, maybe_model(params, A2ATaskQueryParams))
+        )
 
     async def list_tasks(self, params: A2ATaskListParams | dict[str, Any]) -> A2ATaskListResponse:
-        return A2ATaskListResponse.from_dict(await self.call(A2A_METHOD_TASKS_LIST, maybe_model(params, A2ATaskListParams)))
+        return A2ATaskListResponse.from_dict(
+            await self.call(A2A_METHOD_TASKS_LIST, maybe_model(params, A2ATaskListParams))
+        )
 
     async def cancel_task(self, params: A2ATaskQueryParams | dict[str, Any]) -> A2ATask:
-        return A2ATask.from_dict(await self.call(A2A_METHOD_TASKS_CANCEL, maybe_model(params, A2ATaskQueryParams)))
+        return A2ATask.from_dict(
+            await self.call(A2A_METHOD_TASKS_CANCEL, maybe_model(params, A2ATaskQueryParams))
+        )
 
-    async def resubscribe_task(self, params: A2ATaskQueryParams | dict[str, Any]) -> AsyncIterator[A2AStreamEvent]:
-        async for event in self._stream_jsonrpc(A2A_METHOD_TASKS_RESUBSCRIBE, maybe_model(params, A2ATaskQueryParams)):
+    async def resubscribe_task(
+        self, params: A2ATaskQueryParams | dict[str, Any]
+    ) -> AsyncIterator[A2AStreamEvent]:
+        async for event in self._stream_jsonrpc(
+            A2A_METHOD_TASKS_RESUBSCRIBE, maybe_model(params, A2ATaskQueryParams)
+        ):
             yield event
 
-    async def set_task_push_notification_config(self, params: A2ATaskPushConfigParams | dict[str, Any]):
+    async def set_task_push_notification_config(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ):
         return A2ATaskPushNotificationConfig.from_dict(
-            await self.call(A2A_METHOD_TASK_PUSH_NOTIFICATION_SET, maybe_model(params, A2ATaskPushConfigParams))
+            await self.call(
+                A2A_METHOD_TASK_PUSH_NOTIFICATION_SET, maybe_model(params, A2ATaskPushConfigParams)
+            )
         )
 
-    async def get_task_push_notification_config(self, params: A2ATaskPushConfigParams | dict[str, Any]):
+    async def get_task_push_notification_config(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ):
         return A2ATaskPushNotificationConfig.from_dict(
-            await self.call(A2A_METHOD_TASK_PUSH_NOTIFICATION_GET, maybe_model(params, A2ATaskPushConfigParams))
+            await self.call(
+                A2A_METHOD_TASK_PUSH_NOTIFICATION_GET, maybe_model(params, A2ATaskPushConfigParams)
+            )
         )
 
-    async def list_task_push_notification_configs(self, params: A2ATaskPushConfigParams | dict[str, Any]):
+    async def list_task_push_notification_configs(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ):
         return A2ATaskPushConfigList.from_dict(
-            await self.call(A2A_METHOD_TASK_PUSH_NOTIFICATION_LIST, maybe_model(params, A2ATaskPushConfigParams))
+            await self.call(
+                A2A_METHOD_TASK_PUSH_NOTIFICATION_LIST, maybe_model(params, A2ATaskPushConfigParams)
+            )
         )
 
-    async def delete_task_push_notification_config(self, params: A2ATaskPushConfigParams | dict[str, Any]) -> None:
-        await self.call(A2A_METHOD_TASK_PUSH_NOTIFICATION_DELETE, maybe_model(params, A2ATaskPushConfigParams))
+    async def delete_task_push_notification_config(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ) -> None:
+        await self.call(
+            A2A_METHOD_TASK_PUSH_NOTIFICATION_DELETE, maybe_model(params, A2ATaskPushConfigParams)
+        )
 
     async def get_extended_agent_card(self) -> AgentCardResponse:
         return AgentCardResponse.from_dict(await self.call(A2A_METHOD_AGENT_GET_EXTENDED_CARD, {}))
 
-    async def send_message_rest(self, params: A2AMessageSendParams | dict[str, Any]) -> A2ASendMessageResponse:
-        raw = await self._do_rest("POST", "/message:send", body=maybe_model(params, A2AMessageSendParams))
+    async def send_message_rest(
+        self, params: A2AMessageSendParams | dict[str, Any]
+    ) -> A2ASendMessageResponse:
+        raw = await self._do_rest(
+            "POST", "/message:send", body=maybe_model(params, A2AMessageSendParams)
+        )
         return decode_a2a_send_message_response(raw)
 
     async def get_task_rest(self, params: A2ATaskQueryParams | dict[str, Any]) -> A2ATask:
@@ -367,18 +416,26 @@ class A2AClient:
         query = {}
         if params.history_length is not None:
             query["historyLength"] = str(params.history_length)
-        return A2ATask.from_dict(await self._do_rest("GET", f"/tasks/{quote(params.id, safe='')}", query=query))
+        return A2ATask.from_dict(
+            await self._do_rest("GET", f"/tasks/{quote(params.id, safe='')}", query=query)
+        )
 
-    async def list_tasks_rest(self, params: A2ATaskListParams | dict[str, Any]) -> A2ATaskListResponse:
+    async def list_tasks_rest(
+        self, params: A2ATaskListParams | dict[str, Any]
+    ) -> A2ATaskListResponse:
         params = maybe_model(params, A2ATaskListParams)
         query = _a2a_task_list_query(params)
         return A2ATaskListResponse.from_dict(await self._do_rest("GET", "/tasks", query=query))
 
     async def cancel_task_rest(self, params: A2ATaskQueryParams | dict[str, Any]) -> A2ATask:
         params = maybe_model(params, A2ATaskQueryParams)
-        return A2ATask.from_dict(await self._do_rest("POST", f"/tasks/{quote(params.id, safe='')}:cancel"))
+        return A2ATask.from_dict(
+            await self._do_rest("POST", f"/tasks/{quote(params.id, safe='')}:cancel")
+        )
 
-    async def stream_message_rest(self, params: A2AMessageSendParams | dict[str, Any]) -> AsyncIterator[A2AStreamEvent]:
+    async def stream_message_rest(
+        self, params: A2AMessageSendParams | dict[str, Any]
+    ) -> AsyncIterator[A2AStreamEvent]:
         async for event in self._stream_rest(
             "POST",
             "/message:stream",
@@ -386,7 +443,9 @@ class A2AClient:
         ):
             yield event
 
-    async def resubscribe_task_rest(self, params: A2ATaskQueryParams | dict[str, Any]) -> AsyncIterator[A2AStreamEvent]:
+    async def resubscribe_task_rest(
+        self, params: A2ATaskQueryParams | dict[str, Any]
+    ) -> AsyncIterator[A2AStreamEvent]:
         params = maybe_model(params, A2ATaskQueryParams)
         query = {}
         if params.history_length is not None:
@@ -398,7 +457,9 @@ class A2AClient:
         ):
             yield event
 
-    async def set_task_push_notification_config_rest(self, params: A2ATaskPushConfigParams | dict[str, Any]):
+    async def set_task_push_notification_config_rest(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ):
         params = maybe_model(params, A2ATaskPushConfigParams)
         task_id = _a2a_task_id_from_push_params(params)
         return A2ATaskPushNotificationConfig.from_dict(
@@ -409,7 +470,9 @@ class A2AClient:
             )
         )
 
-    async def get_task_push_notification_config_rest(self, params: A2ATaskPushConfigParams | dict[str, Any]):
+    async def get_task_push_notification_config_rest(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ):
         params = maybe_model(params, A2ATaskPushConfigParams)
         task_id = _a2a_task_id_from_push_params(params)
         config_id = _a2a_push_config_id(params)
@@ -420,7 +483,9 @@ class A2AClient:
             )
         )
 
-    async def list_task_push_notification_configs_rest(self, params: A2ATaskPushConfigParams | dict[str, Any]):
+    async def list_task_push_notification_configs_rest(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ):
         params = maybe_model(params, A2ATaskPushConfigParams)
         task_id = _a2a_task_id_from_push_params(params)
         query = {}
@@ -436,7 +501,9 @@ class A2AClient:
             )
         )
 
-    async def delete_task_push_notification_config_rest(self, params: A2ATaskPushConfigParams | dict[str, Any]) -> None:
+    async def delete_task_push_notification_config_rest(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ) -> None:
         params = maybe_model(params, A2ATaskPushConfigParams)
         task_id = _a2a_task_id_from_push_params(params)
         config_id = _a2a_push_config_id(params)
@@ -470,12 +537,14 @@ class A2AClient:
         async with self.http_client.stream(
             "POST",
             self.endpoint,
-            content=json.dumps({
-                "jsonrpc": "2.0",
-                "id": f"openlinker-a2a-{int(time.time() * 1000)}",
-                "method": self._method(method),
-                "params": to_json_value(params),
-            }).encode(),
+            content=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"openlinker-a2a-{int(time.time() * 1000)}",
+                    "method": self._method(method),
+                    "params": to_json_value(params),
+                }
+            ).encode(),
             headers=self._headers("text/event-stream"),
         ) as response:
             if response.status_code < 200 or response.status_code >= 300:
@@ -486,7 +555,9 @@ class A2AClient:
             async for event in read_sse(response.aiter_lines()):
                 yield a2a_stream_event_from_sse(event)
 
-    async def _do_rest(self, method: str, path: str, query: dict[str, str] | None = None, body: Any = None) -> Any:
+    async def _do_rest(
+        self, method: str, path: str, query: dict[str, str] | None = None, body: Any = None
+    ) -> Any:
         response = await self.http_client.request(
             method,
             self._rest_url(path, query),
@@ -515,7 +586,9 @@ class A2AClient:
             if response.status_code < 200 or response.status_code >= 300:
                 body_bytes = await response.aread()
                 raise _parse_a2a_http_error(
-                    httpx.Response(response.status_code, headers=response.headers, content=body_bytes)
+                    httpx.Response(
+                        response.status_code, headers=response.headers, content=body_bytes
+                    )
                 )
             async for event in read_sse(response.aiter_lines()):
                 yield a2a_stream_event_from_sse(event)
@@ -583,7 +656,12 @@ def _normalize_stream_payload(payload: Any) -> dict[str, Any]:
         return {"task": payload}
     if "role" in payload or "parts" in payload:
         return {"message": payload}
-    if "statusUpdate" in payload or "artifactUpdate" in payload or "task" in payload or "message" in payload:
+    if (
+        "statusUpdate" in payload
+        or "artifactUpdate" in payload
+        or "task" in payload
+        or "message" in payload
+    ):
         return payload
     if "status" in payload:
         return {"statusUpdate": payload}
@@ -601,7 +679,9 @@ def _a2a_task_list_query(params: A2ATaskListParams) -> dict[str, str]:
         "pageToken": params.page_token,
         "historyLength": params.history_length,
         "statusTimestampAfter": params.status_timestamp_after,
-        "includeArtifacts": None if params.include_artifacts is None else str(params.include_artifacts).lower(),
+        "includeArtifacts": None
+        if params.include_artifacts is None
+        else str(params.include_artifacts).lower(),
     }
     for key, value in mapping.items():
         if value is not None and str(value).strip():
@@ -640,7 +720,9 @@ def _parse_a2a_http_error(response: httpx.Response) -> OpenLinkerError:
                 message = str(err.get("message") or message)
     except ValueError:
         pass
-    return OpenLinkerError(status_code=response.status_code, code=code, message=message, response_body=raw)
+    return OpenLinkerError(
+        status_code=response.status_code, code=code, message=message, response_body=raw
+    )
 
 
 class A2AGRPCClient:
@@ -688,8 +770,12 @@ class A2AGRPCClient:
         if inspect.isawaitable(result):
             await result
 
-    async def send_message_response(self, params: A2AMessageSendParams | dict[str, Any]) -> A2ASendMessageResponse:
-        resp = await self._transport.send_message(self._send_message_request(params), context=self._context())
+    async def send_message_response(
+        self, params: A2AMessageSendParams | dict[str, Any]
+    ) -> A2ASendMessageResponse:
+        resp = await self._transport.send_message(
+            self._send_message_request(params), context=self._context()
+        )
         return decode_a2a_send_message_response(self._proto_to_dict(resp))
 
     async def send_message(self, params: A2AMessageSendParams | dict[str, Any]) -> A2ATask:
@@ -702,8 +788,12 @@ class A2AGRPCClient:
             )
         raise RuntimeError("openlinker: A2A gRPC SendMessage returned an empty response")
 
-    async def stream_message(self, params: A2AMessageSendParams | dict[str, Any]) -> AsyncIterator[A2AStreamEvent]:
-        stream = self._transport.send_message_streaming(self._send_message_request(params), context=self._context())
+    async def stream_message(
+        self, params: A2AMessageSendParams | dict[str, Any]
+    ) -> AsyncIterator[A2AStreamEvent]:
+        stream = self._transport.send_message_streaming(
+            self._send_message_request(params), context=self._context()
+        )
         async for resp in stream:
             yield self._stream_event_from_proto(resp)
 
@@ -717,7 +807,9 @@ class A2AGRPCClient:
             },
             self._types.GetTaskRequest(),
         )
-        return A2ATask.from_dict(self._proto_to_dict(await self._transport.get_task(request, context=self._context())))
+        return A2ATask.from_dict(
+            self._proto_to_dict(await self._transport.get_task(request, context=self._context()))
+        )
 
     async def list_tasks(self, params: A2ATaskListParams | dict[str, Any]) -> A2ATaskListResponse:
         params = maybe_model(params, A2ATaskListParams)
@@ -740,26 +832,38 @@ class A2AGRPCClient:
 
     async def cancel_task(self, params: A2ATaskQueryParams | dict[str, Any]) -> A2ATask:
         params = maybe_model(params, A2ATaskQueryParams)
-        request = self._parse({"tenant": self.tenant, "id": params.id}, self._types.CancelTaskRequest())
+        request = self._parse(
+            {"tenant": self.tenant, "id": params.id}, self._types.CancelTaskRequest()
+        )
         return A2ATask.from_dict(
             self._proto_to_dict(await self._transport.cancel_task(request, context=self._context()))
         )
 
-    async def resubscribe_task(self, params: A2ATaskQueryParams | dict[str, Any]) -> AsyncIterator[A2AStreamEvent]:
+    async def resubscribe_task(
+        self, params: A2ATaskQueryParams | dict[str, Any]
+    ) -> AsyncIterator[A2AStreamEvent]:
         params = maybe_model(params, A2ATaskQueryParams)
-        request = self._parse({"tenant": self.tenant, "id": params.id}, self._types.SubscribeToTaskRequest())
+        request = self._parse(
+            {"tenant": self.tenant, "id": params.id}, self._types.SubscribeToTaskRequest()
+        )
         async for resp in self._transport.subscribe(request, context=self._context()):
             yield self._stream_event_from_proto(resp)
 
-    async def set_task_push_notification_config(self, params: A2ATaskPushConfigParams | dict[str, Any]):
+    async def set_task_push_notification_config(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ):
         request = self._task_push_config_request(params)
         return A2ATaskPushNotificationConfig.from_dict(
             self._proto_to_dict(
-                await self._transport.create_task_push_notification_config(request, context=self._context())
+                await self._transport.create_task_push_notification_config(
+                    request, context=self._context()
+                )
             )
         )
 
-    async def get_task_push_notification_config(self, params: A2ATaskPushConfigParams | dict[str, Any]):
+    async def get_task_push_notification_config(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ):
         params = maybe_model(params, A2ATaskPushConfigParams)
         request = self._parse(
             {
@@ -771,11 +875,15 @@ class A2AGRPCClient:
         )
         return A2ATaskPushNotificationConfig.from_dict(
             self._proto_to_dict(
-                await self._transport.get_task_push_notification_config(request, context=self._context())
+                await self._transport.get_task_push_notification_config(
+                    request, context=self._context()
+                )
             )
         )
 
-    async def list_task_push_notification_configs(self, params: A2ATaskPushConfigParams | dict[str, Any]):
+    async def list_task_push_notification_configs(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ):
         params = maybe_model(params, A2ATaskPushConfigParams)
         request = self._parse(
             {
@@ -788,11 +896,15 @@ class A2AGRPCClient:
         )
         return A2ATaskPushConfigList.from_dict(
             self._proto_to_dict(
-                await self._transport.list_task_push_notification_configs(request, context=self._context())
+                await self._transport.list_task_push_notification_configs(
+                    request, context=self._context()
+                )
             )
         )
 
-    async def delete_task_push_notification_config(self, params: A2ATaskPushConfigParams | dict[str, Any]) -> None:
+    async def delete_task_push_notification_config(
+        self, params: A2ATaskPushConfigParams | dict[str, Any]
+    ) -> None:
         params = maybe_model(params, A2ATaskPushConfigParams)
         request = self._parse(
             {
@@ -807,7 +919,9 @@ class A2AGRPCClient:
     async def get_extended_agent_card(self) -> AgentCardResponse:
         request = self._parse({"tenant": self.tenant}, self._types.GetExtendedAgentCardRequest())
         return AgentCardResponse.from_dict(
-            self._proto_to_dict(await self._transport.get_extended_agent_card(request, context=self._context()))
+            self._proto_to_dict(
+                await self._transport.get_extended_agent_card(request, context=self._context())
+            )
         )
 
     def _send_message_request(self, params: A2AMessageSendParams | dict[str, Any]) -> Any:
@@ -831,7 +945,9 @@ class A2AGRPCClient:
             "taskId": _a2a_task_id_from_push_params(params),
             "url": params.url or (push.url if push else None),
             "token": params.token or (push.token if push else None),
-            "authentication": to_json_value(params.authentication or (push.authentication if push else None)),
+            "authentication": to_json_value(
+                params.authentication or (push.authentication if push else None)
+            ),
         }
         return self._parse(body, self._types.TaskPushNotificationConfig())
 
@@ -982,5 +1098,5 @@ def _task_state_to_proto(state: str | None) -> str | None:
 def _task_state_from_proto(state: str) -> str:
     normalized = state.strip()
     if normalized.startswith("TASK_STATE_"):
-        return normalized[len("TASK_STATE_"):].lower()
+        return normalized[len("TASK_STATE_") :].lower()
     return normalized.lower()

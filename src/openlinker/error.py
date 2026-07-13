@@ -22,4 +22,3 @@ class OpenLinkerError(Exception):
 
 
 Error = OpenLinkerError
-

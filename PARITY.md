@@ -1,69 +1,68 @@
-# openlinker-go parity
+# OpenLinker SDK parity
 
-This SDK is a Python translation of `github.com/OpenLinker-ai/openlinker-go`.
+The Python SDK follows the same product boundary and canonical Runtime contract as
+`openlinker-go` and `openlinker-js`. Naming follows Python conventions; wire behavior
+is shared.
 
-## Implemented locally, smoke-tested
+## Platform Client
 
-- Core `Client`
-  - `list_agents`, `get_agent`, `get_agent_card`
-  - `run_agent`, `start_agent_run`, callback streaming helpers
-  - run lookup, events, children, artifacts, messages
-  - runtime heartbeat, claim, complete, and `call_agent`
-- Creator registration APIs
-  - create/list/get/update creator agents
-  - create/list/revoke agent tokens
-  - register agent via token
-- Runtime bootstrap
-  - `ensure_runtime_agent`
-  - `EnvRegistrationStore`
-  - `reuse_existing`, `rotate_token`, `force_new`, `validate_only`
-- Native runtime
-  - `Native(handler)` runner
-  - `WithAgent` / `WithFunc` text-agent runner
-  - `runtime_pull`
-  - `runtime_ws`
-  - live event reporting, message deltas, runtime results
-  - `native_run_from_context`
-- Webhooks
-  - external task callback config
-  - HMAC-SHA256 signing and verification helpers
-- A2A JSON-RPC and REST
-  - send/stream message
-  - get/list/cancel/resubscribe task
-  - task push-notification config CRUD
-  - extended agent card
-  - current and legacy method dialects
-- A2A gRPC
-  - optional `grpc` extra backed by the official `a2a-sdk[grpc]`
-  - send/stream message
-  - get/list/cancel/resubscribe task
-  - task push-notification config CRUD
-  - extended agent card
-  - OpenLinker dataclass API normalized to/from A2A protobuf messages
+Implemented:
 
-## Pending
+- Agent discovery and Agent Cards
+- synchronous and asynchronous Run creation
+- Run lookup, events, children, artifacts and messages
+- server-sent Run event streaming and callback helpers
+- creator Agent and Agent Token management
+- webhook signing and verification
+- A2A JSON-RPC, REST and optional gRPC helpers
 
-- Full parity certification.
-  The current state is a local first pass with targeted smoke tests. It should not be
-  called fully equivalent to `openlinker-go` until the Go SDK test suite has been ported
-  or covered by Python equivalents, plus at least one live sandbox integration pass.
-- A2A gRPC live conformance.
-  The adapter is implemented locally against the official A2A Python SDK transport, but
-  has not yet been run against an OpenLinker live gRPC sandbox/conformance fixture.
-- Generated protobuf-free conversion edge cases.
-  The adapter uses `google.protobuf.json_format` to bridge this SDK's dataclasses and
-  official A2A protobuf messages. Text/data/file/message/task basics are covered; richer
-  binary file part and push-notification metadata combinations still need live fixtures.
+The Client surface accepts a User Token only. Agent-side Session and execution methods
+are intentionally absent.
+
+## Runtime Worker
+
+Implemented:
+
+- credential-free discovery of the dedicated Runtime origin
+- Agent Token plus mTLS, TLS 1.3 minimum and redirect refusal
+- Session attachment generation, heartbeat and close
+- WebSocket, long-poll and automatic transport recovery
+- durable assignment-before-ACK and confirmed-before-execute ordering
+- lease renewal, cancellation, drain, capacity and safe shutdown
+- reconnect resume without re-running a previously started handler
+- encrypted assignment journal and Event/Result spool
+- stable Event/Result IDs, business ACK validation and missing-Event repair
+- assignment-scoped delegated Agent calls with mandatory idempotency
+- stable worker identity, rotating Session identity and monotonic Session epoch
+- file permissions, single-process locking, key/ciphertext integrity and capacity gates
+
+The public Python lifecycle is only:
+
+```python
+worker = RuntimeWorker(...)
+await worker.run()
+```
+
+There is no SDK product CLI, native runner, automatic Agent registration or legacy
+heartbeat/claim/result surface.
 
 ## Verification
 
-Current local tests cover:
+The local suite covers:
 
-- core URL/query/header behavior
-- request JSON encoding
-- structured platform errors
-- `Client.a2a_agent`
-- A2A gRPC request/metadata conversion when `a2a-sdk[grpc]` is installed
-- native `runtime_pull`
-- `WithFunc` and `native_run_from_context`
-- webhook signing helpers
+- canonical contract digest, endpoint set and URL generation-name guard
+- assignment confirmation ordering
+- lost assignment/Event/Result ACK replay with stable IDs
+- Pull and WebSocket Session conflict recovery during attachment
+- established Session conflict failure
+- WebSocket to Pull fallback and WebSocket recovery
+- unsafe restart refusal for a previously started Attempt
+- cancellation propagation and acknowledgement
+- discovery/origin/redirect/credential isolation
+- attachment establishment, exact heartbeat binding and reattachment generation isolation
+- store identity, restart replay, locking, permissions, missing key, modified ciphertext,
+  symlink and capacity failures
+- Client, webhook and A2A behavior
+
+Live sandbox closure and optional A2A gRPC integration remain release-environment
+checks rather than unit tests.

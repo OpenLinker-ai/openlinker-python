@@ -95,7 +95,9 @@ async def test_error_response_becomes_openlinker_error():
 
 @pytest.mark.asyncio
 async def test_a2a_agent_inherits_endpoint_token_and_headers():
-    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200))) as hc:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200))
+    ) as hc:
         sdk = openlinker_client.Client(
             "https://api.example.test/api/v1",
             http_client=hc,

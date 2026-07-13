@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Callable
 
 from .model import Model, jfield
@@ -119,7 +118,9 @@ class AgentCardResponse(Model):
     skills: list[JSON] = jfield(default_factory=list)
     security_schemes: JSON | None = jfield("securitySchemes", None)
     security: list[dict[str, list[str]]] = jfield(default_factory=list)
-    security_requirements: list[dict[str, list[str]]] = jfield("securityRequirements", default_factory=list)
+    security_requirements: list[dict[str, list[str]]] = jfield(
+        "securityRequirements", default_factory=list
+    )
     authentication: JSON | None = None
     openlinker: JSON | None = None
     capability: JSON | None = None
@@ -262,168 +263,6 @@ class RunMessageResponse(Model):
     content: str = ""
     payload: Any = None
     created_at: str = ""
-
-
-@dataclass
-class AgentA2AContext(Model):
-    current_run_id: str = ""
-    parent_run_id: str | None = None
-    caller_agent_id: str | None = None
-    protocol_context_id: str | None = None
-    protocol_task_id: str | None = None
-    root_context_id: str | None = None
-    parent_context_id: str | None = None
-    parent_task_id: str | None = None
-    trace_id: str | None = None
-    reference_task_ids: list[str] = jfield(default_factory=list)
-    call_agent_endpoint: str = ""
-    call_agent_method: str = ""
-    agent_token_type: str = ""
-    agent_scopes: list[str] = jfield(default_factory=list)
-
-
-@dataclass
-class ConversationMessage(Model):
-    run_id: str = ""
-    event_sequence: int | None = None
-    role: str = ""
-    content: str = ""
-    payload: dict[str, Any] | None = None
-    created_at: str | None = None
-
-
-@dataclass
-class ConversationContext(Model):
-    id: str = ""
-    session_key: str = ""
-    protocol_context_id: str | None = None
-    root_context_id: str | None = None
-    current_run_id: str = ""
-    current_protocol_task: str | None = jfield("current_protocol_task_id", None)
-    history_before_current: list[ConversationMessage] = jfield(default_factory=list)
-    truncated: bool = False
-    source: str = ""
-
-
-@dataclass
-class AgentHeartbeatResponse(Model):
-    agent_id: str = ""
-    availability_status: str = ""
-    last_checked_at: str | None = None
-    consecutive_failures: int = 0
-    pending_run_count: int = 0
-    claim_now: bool = False
-    next_claim_after_seconds: int = 0
-    recommended_heartbeat_after_seconds: int = 0
-    max_claim_wait_seconds: int = 0
-
-
-@dataclass
-class ClaimRuntimeRunParams(Model):
-    wait_seconds: int = jfield("wait", 0)
-
-
-@dataclass
-class RuntimePullRunResponse(Model):
-    run_id: str = ""
-    agent_id: str = ""
-    input: Any = None
-    metadata: Any = None
-    source: str = ""
-    result_endpoint: str = ""
-    result_method: str = ""
-    result_required: bool = False
-    a2a: AgentA2AContext | None = None
-    conversation: ConversationContext | None = None
-
-
-@dataclass
-class AgentEvent(Model):
-    event_type: str = ""
-    payload: Any = None
-
-
-@dataclass
-class AgentError(Model):
-    code: str = ""
-    message: str = ""
-
-
-@dataclass
-class RuntimePullResultRequest(Model):
-    status: str = ""
-    output: Any = None
-    events: list[AgentEvent] = jfield(default_factory=list)
-    error: AgentError | None = None
-    duration_ms: int = 0
-
-
-@dataclass
-class CallAgentRequest(Model):
-    parent_run_id: str | None = None
-    current_run_id: str | None = None
-    target_agent_id: str = ""
-    reason: str | None = None
-    input: Any = None
-    metadata: Any = None
-    context_id: str | None = None
-    trace_id: str | None = None
-    reference_task_ids: list[str] = jfield(default_factory=list)
-    task_callback: TaskCallbackConfig | None = None
-    push_notification: TaskCallbackConfig | None = None
-    push_notification_alias: TaskCallbackConfig | None = jfield("pushNotification", None)
-    push_notification_config: TaskCallbackConfig | None = jfield("pushNotificationConfig", None)
-
-
-@dataclass
-class RuntimeAssignment(Model):
-    type: str | None = None
-    run_id: str = ""
-    agent_id: str | None = None
-    input: Any = None
-    metadata: Any = None
-    source: str | None = None
-    result_endpoint: str | None = None
-    result_method: str | None = None
-    result_required: bool = False
-    a2a: AgentA2AContext | None = None
-    conversation: ConversationContext | None = None
-
-
-@dataclass
-class RuntimeWSClientMessage(Model):
-    type: str = ""
-    id: str | None = None
-    run_id: str | None = None
-    event_type: str | None = None
-    payload: Any = None
-    status: str | None = None
-    output: Any = None
-    events: list[AgentEvent] = jfield(default_factory=list)
-    error: AgentError | None = None
-    duration_ms: int = 0
-
-
-@dataclass
-class RuntimeWSServerMessage(Model):
-    type: str = ""
-    id: str | None = None
-    run_id: str | None = None
-    agent_id: str | None = None
-    input: Any = None
-    metadata: Any = None
-    source: str | None = None
-    result_endpoint: str | None = None
-    result_method: str | None = None
-    result_required: bool = False
-    a2a: AgentA2AContext | None = None
-    conversation: ConversationContext | None = None
-    status: str | None = None
-    result: RunResponse | None = None
-    event: RunEventResponse | None = None
-    heartbeat: AgentHeartbeatResponse | None = None
-    error: AgentError | None = None
-    retry_after_seconds: int = 0
 
 
 @dataclass
@@ -576,76 +415,3 @@ class AgentTokenListResponse(Model):
     sort_by: str = ""
     sort_dir: str = ""
     has_more: bool = False
-
-
-@dataclass
-class RegisterAgentViaTokenRequest(Model):
-    agent_token: str | None = None
-    slug: str | None = None
-    name: str = ""
-    description: str | None = None
-    endpoint_url: str | None = None
-    endpoint_auth_header: str | None = None
-    price_per_call_cents: int = 0
-    tags: list[str] = jfield(default_factory=list)
-    ability_tags: list[str] = jfield(default_factory=list)
-    skill_ids: list[str] = jfield(default_factory=list)
-    visibility: str | None = None
-    connection_mode: str | None = None
-    mcp_tool_name: str | None = None
-
-
-@dataclass
-class RegisterAgentViaTokenResponse(Model):
-    agent: AgentResponse | None = None
-    agent_token: AgentTokenResponse | None = None
-
-
-REGISTER_POLICY_REUSE_EXISTING = "reuse_existing"
-REGISTER_POLICY_ROTATE_TOKEN = "rotate_token"
-REGISTER_POLICY_FORCE_NEW = "force_new"
-REGISTER_POLICY_VALIDATE_ONLY = "validate_only"
-
-
-@dataclass
-class RuntimeAgentRegistration(Model):
-    agent_id: str | None = None
-    agent_slug: str | None = None
-    agent_name: str | None = None
-    runtime_token: str | None = None
-    runtime_token_id: str | None = None
-    runtime_prefix: str | None = None
-    api_base: str | None = None
-    connector: str | None = None
-    registered_at: datetime | str | None = None
-    updated_at: datetime | str | None = None
-
-    def __str__(self) -> str:
-        if self.agent_slug:
-            return f"{self.agent_slug} ({self.agent_id or ''})".strip()
-        return (self.agent_id or "").strip()
-
-
-@dataclass
-class EnsureRuntimeAgentRequest:
-    slug: str = ""
-    name: str = ""
-    description: str = ""
-    endpoint_url: str = ""
-    endpoint_auth_header: str = ""
-    price_per_call_cents: int = 0
-    tags: list[str] | None = None
-    skill_ids: list[str] | None = None
-    visibility: str = ""
-    connection_mode: str = ""
-    mcp_tool_name: str = ""
-    token_name: str = ""
-    token_scopes: list[str] | None = None
-    token_expires_in_minutes: int = 0
-    policy: str = ""
-    user_token: str = ""
-    runtime_token: str = ""
-    api_base: str = ""
-    connector: str = ""
-    store: Any = None
-
