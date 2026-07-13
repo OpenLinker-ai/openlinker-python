@@ -22,13 +22,13 @@ CANCELLATION_ID = "77777777-7777-4777-8777-777777777777"
 ATTACHMENT_ID = "88888888-8888-4888-8888-888888888888"
 
 
-def ready() -> runtime.RuntimeReady:
+def ready(*, lease_ttl_seconds: int = 60) -> runtime.RuntimeReady:
     return runtime.RuntimeReady(
         core_instance_id="core-a",
         attachment_id=ATTACHMENT_ID,
         features=runtime.RUNTIME_REQUIRED_FEATURES,
         offer_ttl_seconds=30,
-        lease_ttl_seconds=60,
+        lease_ttl_seconds=lease_ttl_seconds,
         database_time=datetime.now(timezone.utc),
     )
 
@@ -79,13 +79,22 @@ class FakeTransport:
         self.ack_failures = 0
         self.event_failures = 0
         self.result_failures = 0
+        self.event_upload_available = True
+        self.result_upload_available = True
+        self.lease_ttl_seconds = 60
+        self.renew_error: Exception | None = None
         self.ack_attempts: list[dict[str, Any]] = []
         self.event_attempts: list[dict[str, Any]] = []
         self.result_attempts: list[dict[str, Any]] = []
+        self.renew_attempts: list[dict[str, Any]] = []
         self.cancel_states: list[str] = []
         self.resume_decisions: list[dict[str, Any]] = []
         self.claim_error: Exception | None = None
         self.claim_seen = asyncio.Event()
+        self.call_entered = asyncio.Event()
+        self.call_release = asyncio.Event()
+        self.call_release.set()
+        self.call_cancelled = asyncio.Event()
 
     async def create_session(self, hello: dict[str, Any]) -> runtime.RuntimeReady:
         del hello
@@ -94,14 +103,14 @@ class FakeTransport:
             raise runtime.RuntimeRemoteError(
                 "RUNTIME_SESSION_CONFLICT", "old Session is still active", status_code=409
             )
-        return ready()
+        return ready(lease_ttl_seconds=self.lease_ttl_seconds)
 
     async def heartbeat_session(self, hello: dict[str, Any]) -> runtime.RuntimeReady:
         del hello
         error = getattr(self, "heartbeat_error", None)
         if error is not None:
             raise error
-        return ready()
+        return ready(lease_ttl_seconds=self.lease_ttl_seconds)
 
     async def close_session(self, request: dict[str, Any]) -> None:
         del request
@@ -146,6 +155,9 @@ class FakeTransport:
         }
 
     async def renew_lease(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.renew_attempts.append(request)
+        if self.renew_error is not None:
+            raise self.renew_error
         return {
             "attempt_identity": request["attempt_identity"],
             "lease_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat(),
@@ -153,6 +165,8 @@ class FakeTransport:
 
     async def send_event(self, request: dict[str, Any]) -> dict[str, Any]:
         self.event_attempts.append(request)
+        if not self.event_upload_available:
+            raise ConnectionError("Event upload is temporarily unavailable")
         if len(self.event_attempts) <= self.event_failures:
             raise ConnectionError("Event ACK response was lost")
         self.event_acked.set()
@@ -167,6 +181,8 @@ class FakeTransport:
         self.result_attempts.append(request)
         self.result_entered.set()
         await self.result_release.wait()
+        if not self.result_upload_available:
+            raise ConnectionError("Result upload is temporarily unavailable")
         if len(self.result_attempts) <= self.result_failures:
             raise ConnectionError("Result ACK response was lost")
         self.result_acked.set()
@@ -222,6 +238,12 @@ class FakeTransport:
         idempotency_key: str,
     ) -> dict[str, Any]:
         del request, node_envelope, invocation_token, idempotency_key
+        self.call_entered.set()
+        try:
+            await self.call_release.wait()
+        except asyncio.CancelledError:
+            self.call_cancelled.set()
+            raise
         return {"run_id": RUN_ID, "status": "running", "dispatch_state": "pending"}
 
     async def close(self) -> None:
@@ -318,6 +340,118 @@ async def test_lost_acks_replay_the_same_assignment_event_and_result_ids():
 
 
 @pytest.mark.asyncio
+async def test_finished_handler_keeps_lease_and_capacity_until_result_ack():
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    transport.assignment = assignment(store)
+    transport.lease_ttl_seconds = 1
+    transport.event_upload_available = False
+    transport.result_upload_available = False
+    handler_calls = 0
+    handler_returned = asyncio.Event()
+    contexts: list[runtime.RuntimeContext] = []
+
+    async def handler(context: runtime.RuntimeContext) -> dict[str, Any]:
+        nonlocal handler_calls
+        handler_calls += 1
+        contexts.append(context)
+        await context.emit("run.progress", {"step": 1})
+        handler_returned.set()
+        return {"answer": "durable"}
+
+    worker = make_worker(store, transport, handler)
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(handler_returned.wait(), timeout=1)
+        for _ in range(200):
+            records = store.assignments()
+            if records and records[0].state == "finished":
+                break
+            await asyncio.sleep(0.005)
+        assert store.assignments()[0].state == "finished"
+
+        with pytest.raises(asyncio.CancelledError):
+            await contexts[0].emit("run.progress", {"step": "too-late"})
+
+        for _ in range(400):
+            if len(transport.renew_attempts) >= 2:
+                break
+            await asyncio.sleep(0.005)
+        assert len(transport.renew_attempts) >= 2
+        assert all(request["inflight"] == 1 for request in transport.renew_attempts)
+        assert worker._capacity_snapshot() == (1, 1)
+        active = worker._active[ATTEMPT_ID]
+        assert active.task is not None and active.task.done()
+        assert active.renew_task is not None and not active.renew_task.done()
+
+        transport.event_upload_available = True
+        await asyncio.wait_for(transport.event_acked.wait(), timeout=1)
+        await asyncio.wait_for(transport.result_entered.wait(), timeout=1)
+
+        renewals_before_result_retry = len(transport.renew_attempts)
+        for _ in range(400):
+            if len(transport.renew_attempts) >= renewals_before_result_retry + 2:
+                break
+            await asyncio.sleep(0.005)
+        assert len(transport.renew_attempts) >= renewals_before_result_retry + 2
+        assert worker._capacity_snapshot() == (1, 1)
+
+        transport.result_upload_available = True
+        await asyncio.wait_for(transport.result_acked.wait(), timeout=1)
+        for _ in range(200):
+            if ATTEMPT_ID not in worker._active:
+                break
+            await asyncio.sleep(0.005)
+        assert ATTEMPT_ID not in worker._active
+        assert worker._capacity_snapshot() == (1, 0)
+        assert store.assignments() == []
+        assert handler_calls == 1
+        assert len({item["result_id"] for item in transport.result_attempts}) == 1
+    finally:
+        transport.event_upload_available = True
+        transport.result_upload_available = True
+        await worker.stop()
+        await running
+
+
+@pytest.mark.asyncio
+async def test_lease_expiry_releases_finished_attempt_without_retrying_handler():
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    transport.assignment = assignment(store)
+    transport.lease_ttl_seconds = 1
+    transport.result_upload_available = False
+    transport.renew_error = runtime.RuntimeRemoteError(
+        "LEASE_EXPIRED", "lease expired", status_code=409
+    )
+    handler_calls = 0
+
+    async def handler(context: runtime.RuntimeContext) -> dict[str, Any]:
+        nonlocal handler_calls
+        del context
+        handler_calls += 1
+        return {"answer": "too-late"}
+
+    worker = make_worker(store, transport, handler)
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(transport.result_entered.wait(), timeout=1)
+        for _ in range(400):
+            if ATTEMPT_ID not in worker._active:
+                break
+            await asyncio.sleep(0.005)
+        assert ATTEMPT_ID not in worker._active
+        assert store.assignments() == []
+        assert handler_calls == 1
+        assert not transport.result_acked.is_set()
+        assert not running.done()
+    finally:
+        transport.result_upload_available = True
+        await worker.stop()
+        await running
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode,kind", [("pull", "pull"), ("ws", "ws"), ("auto", "ws")])
 async def test_session_conflict_retries_only_during_attach(mode: str, kind: str):
     store = runtime.MemoryRuntimeStore()
@@ -383,6 +517,89 @@ async def test_websocket_failure_switches_to_pull_and_probes_websocket_again():
         assert restored_ws.create_calls >= 1
         assert failed_ws.closed
     finally:
+        await worker.stop()
+        await running
+
+
+@pytest.mark.asyncio
+async def test_finished_attempt_survives_transport_recovery_without_reexecuting_handler():
+    store = runtime.MemoryRuntimeStore()
+    failed = FakeTransport(kind="ws")
+    failed.assignment = assignment(store)
+    failed.result_upload_available = False
+    restored = FakeTransport(kind="ws")
+    handler_calls = 0
+
+    async def handler(context: runtime.RuntimeContext) -> dict[str, Any]:
+        nonlocal handler_calls
+        del context
+        handler_calls += 1
+        return {"answer": "once"}
+
+    worker = make_worker(store, failed, handler, mode="auto")
+
+    async def recover() -> FakeTransport:
+        return restored
+
+    worker._test_transport_recovery = recover
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(failed.result_entered.wait(), timeout=1)
+        active = worker._active[ATTEMPT_ID]
+        assert active.task is not None and active.task.done()
+
+        await asyncio.wait_for(worker._recover_transport(failed), timeout=1)
+        assert worker._active[ATTEMPT_ID] is active
+        assert handler_calls == 1
+
+        await asyncio.wait_for(restored.result_acked.wait(), timeout=1)
+        assert handler_calls == 1
+        assert store.assignments() == []
+    finally:
+        failed.result_upload_available = True
+        await worker.stop()
+        await running
+
+
+@pytest.mark.asyncio
+async def test_result_already_acked_resume_releases_finished_attempt_without_reexecution():
+    store = runtime.MemoryRuntimeStore()
+    failed = FakeTransport(kind="ws")
+    offered = assignment(store)
+    failed.assignment = offered
+    failed.result_upload_available = False
+    restored = FakeTransport(kind="ws")
+    restored.resume_decisions = [
+        {
+            "attempt_identity": offered.attempt_identity.to_dict(),
+            "decision": "result_already_acked",
+            "allowed_actions": ["stop_execution", "clear_spool"],
+        }
+    ]
+    handler_calls = 0
+
+    async def handler(context: runtime.RuntimeContext) -> dict[str, Any]:
+        nonlocal handler_calls
+        del context
+        handler_calls += 1
+        return {"answer": "ack was lost"}
+
+    worker = make_worker(store, failed, handler, mode="auto")
+
+    async def recover() -> FakeTransport:
+        return restored
+
+    worker._test_transport_recovery = recover
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(failed.result_entered.wait(), timeout=1)
+        await asyncio.wait_for(worker._recover_transport(failed), timeout=1)
+        assert ATTEMPT_ID not in worker._active
+        assert store.assignments() == []
+        assert handler_calls == 1
+        assert not restored.result_attempts
+    finally:
+        failed.result_upload_available = True
         await worker.stop()
         await running
 
@@ -596,6 +813,45 @@ async def test_runtime_context_call_agent_requires_idempotency_and_validates_sum
         await asyncio.wait_for(delegated.wait(), timeout=1)
         await asyncio.wait_for(transport.result_acked.wait(), timeout=1)
     finally:
+        await worker.stop()
+        await running
+
+
+@pytest.mark.asyncio
+async def test_handler_return_closes_background_runtime_context_calls():
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    transport.assignment = assignment(store)
+    transport.result_upload_available = False
+    transport.call_release.clear()
+    background_calls: list[asyncio.Task[dict[str, Any]]] = []
+
+    async def handler(context: runtime.RuntimeContext) -> dict[str, Any]:
+        background_calls.append(
+            asyncio.create_task(
+                context.call_agent(
+                    TARGET_AGENT_ID,
+                    {"question": "must be scoped"},
+                    idempotency_key="background-delegation",
+                )
+            )
+        )
+        await transport.call_entered.wait()
+        return {"answer": "handler returned"}
+
+    worker = make_worker(store, transport, handler)
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(transport.result_entered.wait(), timeout=1)
+        await asyncio.wait_for(transport.call_cancelled.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await background_calls[0]
+
+        transport.result_upload_available = True
+        await asyncio.wait_for(transport.result_acked.wait(), timeout=1)
+    finally:
+        transport.call_release.set()
+        transport.result_upload_available = True
         await worker.stop()
         await running
 

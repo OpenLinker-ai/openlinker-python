@@ -100,6 +100,7 @@ class RuntimeContext:
     def __init__(self, worker: RuntimeWorker, active: _ActiveAttempt) -> None:
         self._worker = worker
         self._active = active
+        self._closed = asyncio.Event()
         attempt = active.assignment.identity.attempt
         self.run_id = attempt.run_id
         self.agent_id = attempt.agent_id
@@ -111,16 +112,9 @@ class RuntimeContext:
         return self._active.cancel_event.is_set()
 
     async def emit(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
-        if self.cancelled or self._worker._force_cancel.is_set():
+        if self._closed.is_set() or self.cancelled or self._worker._force_cancel.is_set():
             raise asyncio.CancelledError
-        event = RuntimeEvent(event_type, payload or {})
-        event.validate()
-        self._worker._store_required().append_event(
-            self._active.assignment.identity.attempt.attempt_id,
-            event.event_type,
-            event.payload,
-        )
-        self._worker._spool_wakeup.set()
+        self._worker._persist_event(self._active, RuntimeEvent(event_type, payload or {}))
 
     async def call_agent(
         self,
@@ -133,7 +127,7 @@ class RuntimeContext:
     ) -> dict[str, Any]:
         validate_idempotency_key(idempotency_key)
         _canonical_uuid(target_agent_id, "target_agent_id")
-        if self.cancelled or self._worker._force_cancel.is_set():
+        if self._closed.is_set() or self.cancelled or self._worker._force_cancel.is_set():
             raise asyncio.CancelledError
         request = {
             "target_agent_id": target_agent_id,
@@ -158,14 +152,23 @@ class RuntimeContext:
             )
         )
         cancelled = asyncio.create_task(self._active.cancel_event.wait())
-        done, _ = await asyncio.wait({call, cancelled}, return_when=asyncio.FIRST_COMPLETED)
-        if cancelled in done:
-            call.cancel()
-            await asyncio.gather(call, return_exceptions=True)
-            raise asyncio.CancelledError
-        cancelled.cancel()
-        await asyncio.gather(cancelled, return_exceptions=True)
-        return _validate_run_summary(await call)
+        closed = asyncio.create_task(self._closed.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {call, cancelled, closed}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if cancelled in done or closed in done:
+                call.cancel()
+                await asyncio.gather(call, return_exceptions=True)
+                raise asyncio.CancelledError
+            return _validate_run_summary(await call)
+        finally:
+            cancelled.cancel()
+            closed.cancel()
+            await asyncio.gather(cancelled, closed, return_exceptions=True)
+
+    def _close(self) -> None:
+        self._closed.set()
 
 
 class RuntimeWorker:
@@ -557,9 +560,10 @@ class RuntimeWorker:
         context = RuntimeContext(self, active)
         try:
             raw = await _invoke_handler(self.handler, context)
+            context._close()
             result = _normalize_result(raw)
             for event in result.events:
-                await context.emit(event.event_type, event.payload)
+                self._persist_event(active, event)
         except asyncio.CancelledError:
             if active.cancel_event.is_set() or self._force_cancel.is_set():
                 return
@@ -571,8 +575,7 @@ class RuntimeWorker:
                 "HANDLER_ERROR", _bounded(str(exc), 500, "handler failed")
             )
         finally:
-            if active.renew_task is not None and active.renew_task is not asyncio.current_task():
-                active.renew_task.cancel()
+            context._close()
         if active.cancel_event.is_set() or self._force_cancel.is_set():
             return
         duration_ms = result.duration_ms or max(0, int((time.monotonic() - started) * 1000))
@@ -584,7 +587,25 @@ class RuntimeWorker:
             self._store_required().store_result(attempt_id, payload)
             self._spool_permissions[attempt_id] = (True, True)
             self._spool_wakeup.set()
-            self._active.pop(attempt_id, None)
+
+    def _persist_event(self, active: _ActiveAttempt, event: RuntimeEvent) -> None:
+        event.validate()
+        self._store_required().append_event(
+            active.assignment.identity.attempt.attempt_id,
+            event.event_type,
+            event.payload,
+        )
+        self._spool_wakeup.set()
+
+    def _remove_active_attempt(self, attempt_id: str) -> _ActiveAttempt | None:
+        active = self._active.pop(attempt_id, None)
+        if (
+            active is not None
+            and active.renew_task is not None
+            and active.renew_task is not asyncio.current_task()
+        ):
+            active.renew_task.cancel()
+        return active
 
     async def _renew_lease_loop(self, active: _ActiveAttempt) -> None:
         retry = 0
@@ -907,8 +928,16 @@ class RuntimeWorker:
         store = self._store_required()
         for assignment in store.assignments():
             attempt_id = assignment.identity.attempt.attempt_id
+            lease_terminal = False
             async with self._attempt_lock(attempt_id):
-                await self._flush_attempt_spool(transport, assignment)
+                try:
+                    await self._flush_attempt_spool(transport, assignment)
+                except RuntimeRemoteError as exc:
+                    if exc.code not in _LEASE_TERMINAL_CODES and exc.code != "RUN_CANCEL_REQUESTED":
+                        raise
+                    lease_terminal = True
+            if lease_terminal:
+                await self._revoke_attempt(assignment)
 
     async def _flush_attempt_spool(
         self,
@@ -953,6 +982,7 @@ class RuntimeWorker:
         store.clear_terminal_events(attempt_id)
         store.delete_assignment(assignment.identity.assignment_message_id)
         self._spool_permissions.pop(attempt_id, None)
+        self._remove_active_attempt(attempt_id)
 
     async def _replay_events(
         self,
@@ -1063,18 +1093,15 @@ class RuntimeWorker:
             action = decision.get("decision")
             attempt_id = record.identity.attempt.attempt_id
             if action == "continue_execution":
-                if reconnect and record.state == ASSIGNMENT_STARTED:
+                if reconnect and record.state in {ASSIGNMENT_STARTED, ASSIGNMENT_FINISHED}:
                     active = self._active.get(attempt_id)
                     if active is None:
                         raise RuntimeStoreError(
-                            "unsafe reconnect refused: started Attempt has no live handler"
+                            "unsafe reconnect refused: owned Attempt has no live lease owner"
                         )
                     expires = decision.get("lease_expires_at")
                     if expires:
                         active.lease_expires_at = parse_datetime(expires)
-                    self._spool_permissions[attempt_id] = (True, True)
-                    continue
-                if reconnect and record.state == ASSIGNMENT_FINISHED:
                     self._spool_permissions[attempt_id] = (True, True)
                     continue
                 if record.state in {ASSIGNMENT_STARTED, ASSIGNMENT_FINISHED}:
@@ -1126,7 +1153,7 @@ class RuntimeWorker:
                 )
             store.clear_terminal_events(attempt_id)
             store.delete_assignment(record.identity.assignment_message_id)
-            self._active.pop(attempt_id, None)
+            self._remove_active_attempt(attempt_id)
             self._spool_permissions.pop(attempt_id, None)
 
     async def _recover_transport(
@@ -1246,7 +1273,7 @@ class RuntimeWorker:
             except RuntimeStoreError as exc:
                 if str(exc) != "assignment not found":
                     raise
-                self._active.pop(attempt_id, None)
+                self._remove_active_attempt(attempt_id)
                 return
             if current.state not in {
                 ASSIGNMENT_RESULT_ACKED,
@@ -1258,7 +1285,7 @@ class RuntimeWorker:
                 )
             store.discard_terminal_spool(attempt_id)
             store.delete_assignment(current.identity.assignment_message_id)
-            self._active.pop(attempt_id, None)
+            self._remove_active_attempt(attempt_id)
 
     async def _shutdown(self) -> None:
         self._draining = True
