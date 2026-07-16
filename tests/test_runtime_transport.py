@@ -6,7 +6,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+import openlinker.runtime.transport as runtime_transport
 import pytest
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from openlinker import runtime
 from openlinker.runtime.transport import (
@@ -17,6 +20,11 @@ from openlinker.runtime.transport import (
     resolve_runtime_transport_selection,
     validate_platform_origin,
     validate_runtime_origin,
+)
+from openlinker.runtime.worker import (
+    is_runtime_policy_recovery_signal,
+    resolve_runtime_fallback_reason,
+    runtime_policy_recover_once,
 )
 
 
@@ -40,12 +48,8 @@ def test_runtime_discovery_policy_fixtures_are_language_consistent():
             "session_stale_after_ms": round((policy.session_stale_after or 0.0) * 1000),
             "retry_minimum_ms": round((policy.retry_minimum or 0.25) * 1000),
             "retry_maximum_ms": round((policy.retry_maximum or 15.0) * 1000),
-            "websocket_probe_interval_ms": round(
-                (policy.websocket_probe_interval or 15.0) * 1000
-            ),
-            "websocket_probe_timeout_ms": round(
-                (policy.websocket_probe_timeout or 10.0) * 1000
-            ),
+            "websocket_probe_interval_ms": round((policy.websocket_probe_interval or 15.0) * 1000),
+            "websocket_probe_timeout_ms": round((policy.websocket_probe_timeout or 10.0) * 1000),
         } == item["expected"]
 
     for item in fixture["configured_transport_cases"]:
@@ -60,6 +64,60 @@ def test_runtime_discovery_policy_fixtures_are_language_consistent():
             continue
         mode, _ = resolve_runtime_transport_selection(item["configured"], connection.policy)
         assert mode == item["effective"]
+
+    for item in fixture["policy_recovery"]["http"]:
+        error = runtime.RuntimeRemoteError(
+            item["code"], item["message"], status_code=item["status"]
+        )
+        assert is_runtime_policy_recovery_signal(error) is item["recover"]
+    for item in fixture["policy_recovery"]["websocket_close"]:
+        error = ConnectionClosedError(Close(item["code"], item["reason"]), None)
+        assert is_runtime_policy_recovery_signal(error) is item["recover"]
+    for item in fixture["fallback_reason_cases"]:
+        assert (
+            resolve_runtime_fallback_reason(item["configured"], item["transition"])
+            == item["reason"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_policy_fixture_retries_once_and_never_loops():
+    fixture = json.loads(
+        (Path(__file__).parents[1] / "contracts/runtime-discovery-policy-fixtures.json").read_text()
+    )
+    for item in fixture["policy_recovery"]["retry"]:
+        operation_calls = 0
+        discovery_calls = 0
+
+        async def operation() -> str:
+            nonlocal operation_calls
+            outcome = item["outcomes"][operation_calls]
+            operation_calls += 1
+            if outcome == "signal":
+                raise runtime.RuntimeRemoteError(
+                    "FORBIDDEN", "RUNTIME_POLICY_CHANGED", status_code=403
+                )
+            return "ok"
+
+        async def recover_policy(_error: BaseException) -> None:
+            nonlocal discovery_calls
+            discovery_calls += 1
+
+        try:
+            value = await runtime_policy_recover_once(operation, recover_policy)
+            success = True
+        except RuntimeError as exc:
+            value = ""
+            success = False
+            assert (
+                str(exc) == "OpenLinker Runtime policy recovery failed: "
+                "policy signal persisted after one canonical rediscovery"
+            )
+        assert operation_calls == item["operation_calls"]
+        assert discovery_calls == item["discovery_calls"]
+        assert success is item["success"]
+        if success:
+            assert value == "ok"
 
 
 def ready_payload(attachment_id: str = ATTACHMENT_ID) -> dict[str, object]:
@@ -141,7 +199,9 @@ async def test_http_runtime_uses_canonical_unversioned_path_and_agent_token():
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
             _client=client,
         )
-        await transport.create_session({"runtime_session_id": "session"})
+        await transport.create_session(
+            {"runtime_session_id": "session"}, fallback_reason="explicit"
+        )
         await transport.heartbeat_session({"runtime_session_id": "session"})
         assert (
             await transport.claim_assignment(
@@ -153,9 +213,12 @@ async def test_http_runtime_uses_canonical_unversioned_path_and_agent_token():
     assert seen[0].url.path == "/api/v1/agent-runtime/sessions"
     assert "/v2/" not in seen[0].url.path.lower()
     assert seen[0].headers["Authorization"] == "Bearer ol_agent_secret"
+    assert seen[0].headers["OpenLinker-Runtime-Fallback-Reason"] == "explicit"
     assert "OpenLinker-Runtime-Attachment" not in seen[0].headers
     assert seen[1].headers["OpenLinker-Runtime-Attachment"] == ATTACHMENT_ID
     assert seen[2].headers["OpenLinker-Runtime-Attachment"] == ATTACHMENT_ID
+    assert "OpenLinker-Runtime-Fallback-Reason" not in seen[1].headers
+    assert "OpenLinker-Runtime-Fallback-Reason" not in seen[2].headers
 
 
 @pytest.mark.asyncio
@@ -328,6 +391,94 @@ async def test_websocket_heartbeat_allows_capacity_change_but_not_identity_chang
         assert await websocket.heartbeat_session(changed_capacity) == websocket._ready
         with pytest.raises(runtime.RuntimeProtocolError, match="identity mismatch"):
             await websocket.heartbeat_session({**hello, "session_epoch": 2})
+
+
+@pytest.mark.asyncio
+async def test_websocket_upgrade_sends_only_a_bounded_fallback_reason(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def fake_connect(uri: str, *, additional_headers=None, **kwargs):
+        captured["uri"] = uri
+        captured["headers"] = additional_headers
+        captured["kwargs"] = kwargs
+        raise ConnectionError("stop after inspecting the handshake")
+
+    monkeypatch.setattr(runtime_transport, "build_runtime_ssl_context", lambda _mtls: object())
+    monkeypatch.setattr(runtime_transport.websockets, "connect", fake_connect)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(204))
+    ) as client:
+        http = HTTPRuntimeTransport(
+            "https://runtime.example.test",
+            "ol_agent_secret",
+            runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            _client=client,
+        )
+        websocket = WebSocketRuntimeTransport(
+            "https://runtime.example.test",
+            "ol_agent_secret",
+            runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            http,
+        )
+        with pytest.raises(ConnectionError, match="inspecting"):
+            await websocket.connect({"runtime_session_id": "session"}, fallback_reason="recovery")
+        with pytest.raises(ValueError, match="fallback reason"):
+            await websocket.connect(
+                {"runtime_session_id": "session"}, fallback_reason="private network text"
+            )
+
+    assert captured["uri"] == "wss://runtime.example.test/api/v1/agent-runtime/ws"
+    headers = captured["headers"]
+    assert isinstance(headers, dict)
+    assert headers["OpenLinker-Runtime-Fallback-Reason"] == "recovery"
+
+
+@pytest.mark.asyncio
+async def test_websocket_upgrade_decodes_exact_runtime_policy_error(monkeypatch):
+    class UpgradeRejected(Exception):
+        def __init__(self) -> None:
+            self.response = type(
+                "Response",
+                (),
+                {
+                    "status_code": 403,
+                    "body": json.dumps(
+                        {
+                            "error": {
+                                "code": "FORBIDDEN",
+                                "message": "RUNTIME_TRANSPORT_FORBIDDEN",
+                            }
+                        }
+                    ).encode(),
+                },
+            )()
+
+    async def reject_upgrade(_uri: str, *, additional_headers=None, **_kwargs):
+        del additional_headers
+        raise UpgradeRejected
+
+    monkeypatch.setattr(runtime_transport, "build_runtime_ssl_context", lambda _mtls: object())
+    monkeypatch.setattr(runtime_transport.websockets, "connect", reject_upgrade)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(204))
+    ) as client:
+        http = HTTPRuntimeTransport(
+            "https://runtime.example.test",
+            "ol_agent_secret",
+            runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            _client=client,
+        )
+        websocket = WebSocketRuntimeTransport(
+            "https://runtime.example.test",
+            "ol_agent_secret",
+            runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            http,
+        )
+        with pytest.raises(runtime.RuntimeRemoteError) as raised:
+            await websocket.connect(
+                {"runtime_session_id": "session"}, fallback_reason="policy_forced"
+            )
+    assert is_runtime_policy_recovery_signal(raised.value)
 
 
 @pytest.mark.asyncio

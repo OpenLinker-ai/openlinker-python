@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
+from websockets.exceptions import ConnectionClosed
+
 from .store import (
     ASSIGNMENT_ACK_SENT,
     ASSIGNMENT_CONFIRMED,
@@ -219,6 +221,7 @@ class RuntimeWorker:
         self.store = store
         self.allow_unsafe_memory_store = allow_unsafe_memory_store
         self.transport_mode = transport.strip().lower()
+        self._configured_transport_mode = self.transport_mode
         self.node_version = node_version.strip() or DEFAULT_NODE_VERSION
         self.capacity = capacity
         self.claim_wait = claim_wait
@@ -233,6 +236,14 @@ class RuntimeWorker:
         self.on_fatal = on_fatal
         self.on_drain = on_drain
         self.logger = logger or logging.getLogger("openlinker.runtime")
+
+        self._configured_timing = {
+            "heartbeat_interval": self.heartbeat_interval,
+            "retry_minimum": self.retry_minimum,
+            "retry_maximum": self.retry_maximum,
+            "websocket_probe_interval": self.websocket_probe_interval,
+            "websocket_probe_timeout": self.websocket_probe_timeout,
+        }
 
         self._validate_config()
         self._started = False
@@ -252,11 +263,18 @@ class RuntimeWorker:
         self._spool_permissions: dict[str, tuple[bool, bool]] = {}
         self._cancellations: set[str] = set()
         self._background: set[asyncio.Task[Any]] = set()
+        self._websocket_probe_task: asyncio.Task[Any] | None = None
         self._claim_switch_lock = asyncio.Lock()
         self._transport_transitioning = False
         self._transport_order: tuple[str, ...] = ("ws", "pull")
         self._session_stale_after = 0.0
         self._test_transport_recovery: Callable[[], Awaitable[RuntimeTransport]] | None = None
+        self._policy_recovery_lock = asyncio.Lock()
+        self._policy_revision = 0
+        self._policy_last_observed = -1
+        self._policy_last_error: BaseException | None = None
+        self._policy_terminal_error: RuntimePolicyRecoveryError | None = None
+        self._attachment_reason = "explicit"
 
     async def run(self) -> None:
         if self._started:
@@ -309,8 +327,16 @@ class RuntimeWorker:
             raise ValueError(
                 "MemoryRuntimeStore requires allow_unsafe_memory_store=True and is not production-safe"
             )
-        await self._setup_transport()
-        self._ready = await self._attach_session(self._transport_required())
+        observed_revision = self._policy_revision
+        try:
+            await self._setup_transport()
+            self._ready = await self._attach_session(self._transport_required())
+        except Exception as exc:
+            if not is_runtime_policy_recovery_signal(exc):
+                raise
+            self._ready = await self._recover_runtime_policy(
+                observed_revision, resume_durable=False
+            )
         await _invoke_optional(self.on_ready, self._ready)
         await self._resume_durable_state(reconnect=False)
         for operation in (
@@ -320,8 +346,7 @@ class RuntimeWorker:
             self._spool_loop,
         ):
             self._spawn(operation())
-        if self._auto_allows_pull_fallback() and self._transport_required().kind == "pull":
-            self._spawn(self._websocket_probe_loop())
+        self._ensure_websocket_probe_loop()
 
     async def _setup_transport(self) -> None:
         if self._transport is not None:
@@ -333,14 +358,22 @@ class RuntimeWorker:
             self._apply_transport_policy(connection.policy)
         self.runtime_url = validate_runtime_origin(origin)
         self._http_transport = HTTPRuntimeTransport(self.runtime_url, self.agent_token, self.mtls)
+        selected_reason = resolve_runtime_fallback_reason(
+            self._configured_transport_mode, "policy_selected"
+        )
         if self.transport_mode == "pull":
             self._transport = self._http_transport
+            self._attachment_reason = selected_reason
             return
         if self.transport_mode == "ws":
-            self._transport = await self._connect_websocket_with_retry(retry_all=True)
+            self._transport = await self._connect_websocket_with_retry(
+                retry_all=True, fallback_reason=selected_reason
+            )
+            self._attachment_reason = selected_reason
             return
         if not self._auto_prefers_websocket():
             self._transport = self._http_transport
+            self._attachment_reason = selected_reason
             return
         try:
             websocket = WebSocketRuntimeTransport(
@@ -349,28 +382,39 @@ class RuntimeWorker:
                 self.mtls,
                 self._http_transport,
             )
-            await websocket.connect(self._hello())
+            await websocket.connect(self._hello(), fallback_reason=selected_reason)
             self._transport = websocket
+            self._attachment_reason = selected_reason
         except Exception as exc:
-            if _fatal_error(exc) and not _session_conflict(exc):
+            if (
+                _fatal_error(exc) or is_runtime_policy_recovery_signal(exc)
+            ) and not _session_conflict(exc):
                 raise
             if _session_conflict(exc):
                 try:
-                    self._transport = await self._connect_websocket_with_retry(retry_all=False)
+                    self._transport = await self._connect_websocket_with_retry(
+                        retry_all=False, fallback_reason=selected_reason
+                    )
+                    self._attachment_reason = selected_reason
                     return
                 except Exception as retry_error:
                     if _fatal_error(retry_error):
                         raise
             if not self._auto_allows_pull_fallback():
-                self._transport = await self._connect_websocket_with_retry(retry_all=True)
+                self._transport = await self._connect_websocket_with_retry(
+                    retry_all=True, fallback_reason=selected_reason
+                )
+                self._attachment_reason = selected_reason
                 return
             self._transport = self._http_transport
+            self._attachment_reason = "websocket_unavailable"
 
     async def _connect_websocket_with_retry(
         self,
         *,
         retry_all: bool,
         continue_during_shutdown: bool = False,
+        fallback_reason: str = "explicit",
     ) -> WebSocketRuntimeTransport:
         attempt = 0
         while not self._force_cancel.is_set() and (
@@ -385,14 +429,16 @@ class RuntimeWorker:
                 self._http_transport,
             )
             try:
-                await websocket.connect(self._hello())
+                await websocket.connect(self._hello(), fallback_reason=fallback_reason)
                 return websocket
             except asyncio.CancelledError:
                 await websocket.close()
                 raise
             except Exception as exc:
                 await websocket.close()
-                if _fatal_error(exc) and not _session_conflict(exc):
+                if (
+                    _fatal_error(exc) or is_runtime_policy_recovery_signal(exc)
+                ) and not _session_conflict(exc):
                     raise
                 if not retry_all and not _session_conflict(exc):
                     raise
@@ -408,17 +454,30 @@ class RuntimeWorker:
         transport: RuntimeTransport,
         *,
         continue_during_shutdown: bool = False,
+        fallback_reason: str | None = None,
+        policy_aware: bool = False,
     ) -> RuntimeReady:
         attempt = 0
         while not self._force_cancel.is_set() and (
             continue_during_shutdown or not self._stopping.is_set()
         ):
             try:
-                return await transport.create_session(self._hello())
+
+                async def operation() -> RuntimeReady:
+                    return await transport.create_session(
+                        self._hello(),
+                        fallback_reason=fallback_reason or self._attachment_reason,
+                    )
+
+                if policy_aware:
+                    return await self._policy_operation(operation)
+                return await operation()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if _fatal_error(exc) and not _session_conflict(exc):
+                if (
+                    _fatal_error(exc) or is_runtime_policy_recovery_signal(exc)
+                ) and not _session_conflict(exc):
                     raise
                 if continue_during_shutdown:
                     await self._wait_force_or_cancel(None, self._retry_delay(attempt))
@@ -439,17 +498,23 @@ class RuntimeWorker:
                 continue
             transport = self._transport_required()
             try:
-                async with self._claim_switch_lock:
-                    if transport is not self._transport_required():
-                        continue
-                    claimed = await transport.claim_assignment(
-                        int(self.claim_wait),
-                        {
-                            "runtime_session_id": self._store_required().identity.runtime_session_id,
-                            "capacity": capacity,
-                            "inflight": inflight,
-                        },
-                    )
+
+                async def claim() -> ClaimedAssignment | None:
+                    nonlocal transport
+                    async with self._claim_switch_lock:
+                        transport = self._transport_required()
+                        return await transport.claim_assignment(
+                            int(self.claim_wait),
+                            {
+                                "runtime_session_id": (
+                                    self._store_required().identity.runtime_session_id
+                                ),
+                                "capacity": capacity,
+                                "inflight": inflight,
+                            },
+                        )
+
+                claimed = await self._policy_operation(claim)
                 attempt = 0
                 if claimed is not None:
                     await self._handle_assignment(claimed)
@@ -642,14 +707,20 @@ class RuntimeWorker:
                 )
                 capacity, inflight = self._capacity_snapshot()
                 transport = self._transport_required()
-                renewed = await transport.renew_lease(
-                    {
-                        "attempt_identity": record.identity.attempt.to_dict(),
-                        "last_client_event_seq": record.last_client_event_seq,
-                        "capacity": capacity,
-                        "inflight": inflight,
-                    }
-                )
+
+                async def renew() -> dict[str, Any]:
+                    nonlocal transport
+                    transport = self._transport_required()
+                    return await transport.renew_lease(
+                        {
+                            "attempt_identity": record.identity.attempt.to_dict(),
+                            "last_client_event_seq": record.last_client_event_seq,
+                            "capacity": capacity,
+                            "inflight": inflight,
+                        }
+                    )
+
+                renewed = await self._policy_operation(renew)
                 _require_response_keys(
                     renewed,
                     required={"attempt_identity", "lease_expires_at"},
@@ -668,6 +739,9 @@ class RuntimeWorker:
             except asyncio.CancelledError:
                 raise
             except RuntimeRemoteError as exc:
+                if is_runtime_policy_recovery_signal(exc):
+                    await self._report_fatal(exc)
+                    return
                 if self._transport_transitioning or (
                     "transport" in locals() and transport is not self._transport_required()
                 ):
@@ -682,6 +756,9 @@ class RuntimeWorker:
                 await self._wait_attempt(active, self._retry_delay(retry))
                 retry += 1
             except Exception as exc:
+                if is_runtime_policy_recovery_signal(exc):
+                    await self._report_fatal(exc)
+                    return
                 if self._transport_transitioning or (
                     "transport" in locals() and transport is not self._transport_required()
                 ):
@@ -713,11 +790,20 @@ class RuntimeWorker:
                 continue
             transport = self._transport_required()
             try:
-                self._ready = await transport.heartbeat_session(self._hello())
+
+                async def heartbeat() -> RuntimeReady:
+                    nonlocal transport
+                    transport = self._transport_required()
+                    return await transport.heartbeat_session(self._hello())
+
+                self._ready = await self._policy_operation(heartbeat)
                 attempt = 0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if is_runtime_policy_recovery_signal(exc):
+                    await self._report_fatal(exc)
+                    return
                 if self._transport_transitioning or transport is not self._transport_required():
                     attempt = 0
                     continue
@@ -744,13 +830,22 @@ class RuntimeWorker:
                 continue
             transport = self._transport_required()
             try:
-                commands = await transport.poll_commands(
-                    self._store_required().identity.runtime_session_id,
-                    int(self.command_wait),
-                )
+
+                async def poll_commands() -> list[dict[str, Any]]:
+                    nonlocal transport
+                    transport = self._transport_required()
+                    return await transport.poll_commands(
+                        self._store_required().identity.runtime_session_id,
+                        int(self.command_wait),
+                    )
+
+                commands = await self._policy_operation(poll_commands)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if is_runtime_policy_recovery_signal(exc):
+                    await self._report_fatal(exc)
+                    return
                 if self._transport_transitioning or transport is not self._transport_required():
                     attempt = 0
                     continue
@@ -927,11 +1022,20 @@ class RuntimeWorker:
                 if self._transport_transitioning:
                     attempt = max(attempt, 1)
                     continue
-                await self._flush_spool(transport)
+
+                async def flush() -> None:
+                    nonlocal transport
+                    transport = self._transport_required()
+                    await self._flush_spool(transport)
+
+                await self._policy_operation(flush)
                 attempt = 0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if is_runtime_policy_recovery_signal(exc):
+                    await self._report_fatal(exc)
+                    return
                 if self._transport_transitioning or transport is not self._transport_required():
                     attempt = max(attempt, 1)
                     continue
@@ -1028,6 +1132,7 @@ class RuntimeWorker:
         reconnect: bool,
         transport: RuntimeTransport | None = None,
         continue_during_shutdown: bool = False,
+        policy_aware: bool = True,
     ) -> None:
         store = self._store_required()
         records = sorted(store.assignments(), key=lambda item: item.identity.attempt.attempt_id)
@@ -1048,9 +1153,8 @@ class RuntimeWorker:
                 item["pending_result_id"] = result.result_id
                 item["final_client_event_seq"] = result.final_client_event_seq
             attempts.append(item)
-        resume_transport = transport or self._transport_required()
         decisions = await self._retry_call(
-            lambda: resume_transport.resume(
+            lambda: (transport or self._transport_required()).resume(
                 {
                     "node_id": self.node_id,
                     "agent_id": self.agent_id,
@@ -1061,6 +1165,7 @@ class RuntimeWorker:
             ),
             tolerate_transport_switch=transport is None,
             continue_during_shutdown=continue_during_shutdown,
+            policy_aware=policy_aware,
         )
         if len(decisions) != len(records):
             raise RuntimeProtocolError("Runtime resume response count mismatch")
@@ -1178,6 +1283,22 @@ class RuntimeWorker:
         *,
         continue_during_shutdown: bool = False,
     ) -> None:
+        observed_revision = self._policy_revision
+        try:
+            await self._recover_transport_once(
+                failed, continue_during_shutdown=continue_during_shutdown
+            )
+        except Exception as exc:
+            if not is_runtime_policy_recovery_signal(exc):
+                raise
+            await self._recover_runtime_policy(observed_revision)
+
+    async def _recover_transport_once(
+        self,
+        failed: RuntimeTransport,
+        *,
+        continue_during_shutdown: bool = False,
+    ) -> None:
         async with self._claim_switch_lock:
             if failed is not self._transport_required():
                 return
@@ -1191,13 +1312,19 @@ class RuntimeWorker:
                     if self._http_transport is None:
                         raise ConnectionError("HTTP Runtime transport is unavailable")
                     replacement = self._http_transport
+                    self._attachment_reason = "websocket_unavailable"
                 else:
                     if self._http_transport is None:
                         raise ConnectionError("Runtime transport cannot reconnect")
+                    reconnect_reason = resolve_runtime_fallback_reason(
+                        self._configured_transport_mode, "same_transport_reconnect"
+                    )
                     replacement = await self._connect_websocket_with_retry(
                         retry_all=True,
                         continue_during_shutdown=continue_during_shutdown,
+                        fallback_reason=reconnect_reason,
                     )
+                    self._attachment_reason = reconnect_reason
                 replacement_ready = await self._attach_session(
                     replacement,
                     continue_during_shutdown=continue_during_shutdown,
@@ -1206,6 +1333,7 @@ class RuntimeWorker:
                     reconnect=True,
                     transport=replacement,
                     continue_during_shutdown=continue_during_shutdown,
+                    policy_aware=False,
                 )
                 self._transport = replacement
                 self._ready = replacement_ready
@@ -1217,8 +1345,7 @@ class RuntimeWorker:
                 self._transport_transitioning = False
             if previous is not replacement and previous is not self._http_transport:
                 await previous.close()
-            if self._auto_allows_pull_fallback() and replacement.kind == "pull":
-                self._spawn(self._websocket_probe_loop())
+            self._ensure_websocket_probe_loop()
 
     async def _websocket_probe_loop(self) -> None:
         attempt = 0
@@ -1233,6 +1360,7 @@ class RuntimeWorker:
             await self._wait_or_stop(delay)
             if self._stopping.is_set():
                 return
+            observed_revision = self._policy_revision
             try:
                 self._transport_transitioning = True
                 async with self._claim_switch_lock:
@@ -1246,19 +1374,33 @@ class RuntimeWorker:
                             timeout=self.websocket_probe_timeout,
                         )
                         replacement_ready = await self._attach_session(replacement)
-                        await self._resume_durable_state(reconnect=True, transport=replacement)
+                        await self._resume_durable_state(
+                            reconnect=True, transport=replacement, policy_aware=False
+                        )
                         self._transport = replacement
                         self._ready = replacement_ready
-                    except Exception:
+                        self._attachment_reason = "recovery"
+                    except Exception as exc:
                         if replacement is not None:
                             await replacement.close()
-                        if previous is not None:
-                            restored = await self._attach_session(previous)
-                            await self._resume_durable_state(reconnect=True, transport=previous)
+                        if previous is not None and not is_runtime_policy_recovery_signal(exc):
+                            restored = await self._attach_session(
+                                previous, fallback_reason="websocket_unavailable"
+                            )
+                            await self._resume_durable_state(
+                                reconnect=True, transport=previous, policy_aware=False
+                            )
                             self._ready = restored
+                            self._attachment_reason = "websocket_unavailable"
                         raise
                 return
             except Exception as exc:
+                if is_runtime_policy_recovery_signal(exc):
+                    await self._recover_runtime_policy(observed_revision)
+                    if self._transport_required().kind != "pull":
+                        return
+                    attempt = 0
+                    continue
                 if _fatal_error(exc):
                     await self._report_fatal(exc)
                     return
@@ -1406,6 +1548,163 @@ class RuntimeWorker:
         if lease_expires_at <= datetime.now(timezone.utc):
             raise RuntimeProtocolError("Runtime assignment confirmation lease is expired")
 
+    async def _policy_operation(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        # New operations wait for an in-flight recovery before observing the
+        # policy revision. Operations already in flight retain the old revision
+        # and therefore join the same single-flight incident.
+        async with self._policy_recovery_lock:
+            if self._policy_terminal_error is not None:
+                raise self._policy_terminal_error
+            observed_revision = self._policy_revision
+        try:
+            return await operation()
+        except Exception as exc:
+            if not is_runtime_policy_recovery_signal(exc):
+                raise
+            await self._recover_runtime_policy(observed_revision)
+            # Exactly one direct retry. A second policy signal becomes a shared
+            # terminal error and cannot recurse or reach the transport again.
+            try:
+                return await operation()
+            except Exception as retry_error:
+                if not is_runtime_policy_recovery_signal(retry_error):
+                    raise
+                raise await self._fail_runtime_policy_recovery(retry_error)
+
+    async def _recover_runtime_policy(
+        self,
+        observed_revision: int,
+        *,
+        resume_durable: bool = True,
+    ) -> RuntimeReady:
+        async with self._policy_recovery_lock:
+            if self._policy_terminal_error is not None:
+                raise self._policy_terminal_error
+            if observed_revision != self._policy_revision:
+                if self._policy_last_observed == observed_revision:
+                    if self._policy_last_error is not None:
+                        raise self._policy_last_error
+                    if self._ready is None:
+                        raise RuntimePolicyRecoveryError(
+                            RuntimeError("Runtime policy recovery returned no Ready state")
+                        )
+                    return self._ready
+                if self._ready is None:
+                    raise RuntimePolicyRecoveryError(
+                        RuntimeError("Runtime policy revision advanced without Ready state")
+                    )
+                return self._ready
+            self._policy_revision += 1
+            self._policy_last_observed = observed_revision
+            self._policy_last_error = None
+            try:
+                ready = await self._recover_runtime_policy_once(resume_durable=resume_durable)
+                self._ready = ready
+                return ready
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                error = (
+                    exc
+                    if isinstance(exc, RuntimePolicyRecoveryError)
+                    else RuntimePolicyRecoveryError(exc)
+                )
+                self._policy_last_error = error
+                self._policy_terminal_error = error
+                raise error
+
+    async def _fail_runtime_policy_recovery(
+        self, cause: BaseException
+    ) -> RuntimePolicyRecoveryError:
+        async with self._policy_recovery_lock:
+            if self._policy_terminal_error is not None:
+                return self._policy_terminal_error
+            error = RuntimePolicyRecoveryError(
+                RuntimeError("policy signal persisted after one canonical rediscovery")
+            )
+            error.__cause__ = cause
+            self._policy_last_error = error
+            self._policy_terminal_error = error
+            return error
+
+    async def _recover_runtime_policy_once(self, *, resume_durable: bool) -> RuntimeReady:
+        if not self.platform_url:
+            raise RuntimePolicyRecoveryError(
+                RuntimeError(
+                    "canonical rediscovery requires platform_url; "
+                    "an explicit runtime_url alone fails closed"
+                )
+            )
+        connection = await discover_runtime_connection(self.platform_url)
+        self._apply_transport_policy(connection.policy)
+        runtime_url = validate_runtime_origin(connection.runtime_origin)
+        replacement_http = HTTPRuntimeTransport(runtime_url, self.agent_token, self.mtls)
+        previous_transport = self._transport
+        previous_http = self._http_transport
+        replacement: RuntimeTransport = replacement_http
+        reason = resolve_runtime_fallback_reason(
+            self._configured_transport_mode, "policy_rediscovery"
+        )
+        self.runtime_url = runtime_url
+        self._http_transport = replacement_http
+        try:
+            if self.transport_mode == "ws" or self._auto_prefers_websocket():
+                websocket = WebSocketRuntimeTransport(
+                    runtime_url,
+                    self.agent_token,
+                    self.mtls,
+                    replacement_http,
+                )
+                try:
+                    await websocket.connect(self._hello(), fallback_reason=reason)
+                    replacement = websocket
+                except Exception as exc:
+                    await websocket.close()
+                    if _fatal_error(exc) or is_runtime_policy_recovery_signal(exc):
+                        raise
+                    if self.transport_mode == "ws" or not self._auto_allows_pull_fallback():
+                        replacement = await self._connect_websocket_with_retry(
+                            retry_all=True,
+                            fallback_reason=reason,
+                        )
+                    else:
+                        replacement = replacement_http
+                        reason = "websocket_unavailable"
+
+            self._transport_transitioning = True
+            async with self._claim_switch_lock:
+                ready = await self._attach_session(
+                    replacement,
+                    fallback_reason=reason,
+                    policy_aware=False,
+                )
+                if resume_durable:
+                    await self._resume_durable_state(
+                        reconnect=True,
+                        transport=replacement,
+                        policy_aware=False,
+                    )
+                self._transport = replacement
+                self._attachment_reason = reason
+        except BaseException:
+            await replacement.close()
+            if replacement_http is not replacement:
+                await replacement_http.close()
+            self._http_transport = previous_http
+            raise
+        finally:
+            self._transport_transitioning = False
+        for item in {
+            id(value): value for value in (previous_transport, previous_http) if value
+        }.values():
+            if item is not replacement and item is not replacement_http:
+                await item.close()
+        self._spool_wakeup.set()
+        if resume_durable:
+            self._ensure_websocket_probe_loop()
+        self.logger.debug("Runtime transport policy recovered through canonical rediscovery")
+        return ready
+
     async def _retry_call(
         self,
         operation: Callable[[], Awaitable[Any]],
@@ -1414,6 +1713,7 @@ class RuntimeWorker:
         tolerate_transport_switch: bool = True,
         continue_during_shutdown: bool = False,
         cancellation: asyncio.Event | None = None,
+        policy_aware: bool = True,
     ) -> Any:
         attempt = 0
         while not self._force_cancel.is_set() and (
@@ -1423,10 +1723,14 @@ class RuntimeWorker:
                 break
             transport = self._transport_required()
             try:
+                if policy_aware:
+                    return await self._policy_operation(operation)
                 return await operation()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if is_runtime_policy_recovery_signal(exc):
+                    raise
                 if tolerate_transport_switch and (
                     self._transport_transitioning or transport is not self._transport_required()
                 ):
@@ -1469,6 +1773,20 @@ class RuntimeWorker:
         self._background.add(task)
         task.add_done_callback(self._background_task_done)
         return task
+
+    def _ensure_websocket_probe_loop(self) -> None:
+        if not self._auto_allows_pull_fallback() or self._transport_required().kind != "pull":
+            return
+        if self._websocket_probe_task is not None and not self._websocket_probe_task.done():
+            return
+        task = self._spawn(self._websocket_probe_loop())
+        self._websocket_probe_task = task
+
+        def clear(completed: asyncio.Task[Any]) -> None:
+            if self._websocket_probe_task is completed:
+                self._websocket_probe_task = None
+
+        task.add_done_callback(clear)
 
     def _background_task_done(self, task: asyncio.Task[Any]) -> None:
         self._background.discard(task)
@@ -1552,33 +1870,43 @@ class RuntimeWorker:
             self._http_transport,
         )
         try:
-            await websocket.connect(self._hello())
+            await websocket.connect(self._hello(), fallback_reason="recovery")
             return websocket
         except BaseException:
             await websocket.close()
             raise
 
     def _apply_transport_policy(self, policy: RuntimeTransportPolicy) -> None:
-        mode, order = resolve_runtime_transport_selection(self.transport_mode, policy)
-        self.transport_mode = mode
+        _, order = resolve_runtime_transport_selection(self._configured_transport_mode, policy)
         self._transport_order = order
-        if policy.heartbeat_interval is not None:
-            self.heartbeat_interval = policy.heartbeat_interval
-        if policy.retry_minimum is not None:
-            self.retry_minimum = policy.retry_minimum
-        if policy.retry_maximum is not None:
-            self.retry_maximum = policy.retry_maximum
-        if policy.websocket_probe_interval is not None:
-            self.websocket_probe_interval = policy.websocket_probe_interval
-        if policy.websocket_probe_timeout is not None:
-            self.websocket_probe_timeout = policy.websocket_probe_timeout
-        if policy.session_stale_after is not None:
-            self._session_stale_after = policy.session_stale_after
+        self.heartbeat_interval = (
+            policy.heartbeat_interval
+            if policy.heartbeat_interval is not None
+            else self._configured_timing["heartbeat_interval"]
+        )
+        self.retry_minimum = (
+            policy.retry_minimum
+            if policy.retry_minimum is not None
+            else self._configured_timing["retry_minimum"]
+        )
+        self.retry_maximum = (
+            policy.retry_maximum
+            if policy.retry_maximum is not None
+            else self._configured_timing["retry_maximum"]
+        )
+        self.websocket_probe_interval = (
+            policy.websocket_probe_interval
+            if policy.websocket_probe_interval is not None
+            else self._configured_timing["websocket_probe_interval"]
+        )
+        self.websocket_probe_timeout = (
+            policy.websocket_probe_timeout
+            if policy.websocket_probe_timeout is not None
+            else self._configured_timing["websocket_probe_timeout"]
+        )
+        self._session_stale_after = policy.session_stale_after or 0.0
         self._validate_config()
-        if (
-            self._session_stale_after > 0
-            and self.heartbeat_interval >= self._session_stale_after
-        ):
+        if self._session_stale_after > 0 and self.heartbeat_interval >= self._session_stale_after:
             raise RuntimeProtocolError(
                 "OpenLinker Runtime heartbeat interval must be below the Session stale interval"
             )
@@ -1604,7 +1932,7 @@ class RuntimeWorker:
             validate_runtime_origin(self.runtime_url)
         else:
             validate_platform_origin(self.platform_url)
-        if self.transport_mode not in {"auto", "ws", "pull"}:
+        if self._configured_transport_mode not in {"auto", "ws", "pull"}:
             raise ValueError("transport must be 'auto', 'ws', or 'pull'")
         if not callable(self.handler) and not callable(getattr(self.handler, "handle", None)):
             raise ValueError("Runtime handler is required")
@@ -1717,6 +2045,8 @@ def _event_ranges(events: list[Any]) -> list[tuple[int, int]]:
 
 
 def _fatal_error(exc: BaseException) -> bool:
+    if isinstance(exc, RuntimePolicyRecoveryError) or is_runtime_policy_recovery_signal(exc):
+        return True
     if isinstance(exc, (RuntimeProtocolError, RuntimeStoreError)):
         return True
     return isinstance(exc, RuntimeRemoteError) and (
@@ -1726,6 +2056,73 @@ def _fatal_error(exc: BaseException) -> bool:
 
 def _session_conflict(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeRemoteError) and exc.code == "RUNTIME_SESSION_CONFLICT"
+
+
+class RuntimePolicyRecoveryError(RuntimeError):
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(f"OpenLinker Runtime policy recovery failed: {cause}")
+        self.cause = cause
+
+
+def is_runtime_policy_recovery_signal(exc: BaseException) -> bool:
+    if isinstance(exc, RuntimePolicyRecoveryError):
+        return False
+    if isinstance(exc, RuntimeRemoteError):
+        return (
+            exc.status_code == 403
+            and exc.code == "FORBIDDEN"
+            and exc.message in {"RUNTIME_TRANSPORT_FORBIDDEN", "RUNTIME_POLICY_CHANGED"}
+        )
+    if not isinstance(exc, ConnectionClosed):
+        return False
+    received = getattr(exc, "rcvd", None)
+    if received is not None:
+        code = getattr(received, "code", None)
+        reason = getattr(received, "reason", None)
+    else:
+        code = getattr(exc, "code", None)
+        reason = getattr(exc, "reason", None)
+    return code == 1008 and reason == "RUNTIME_POLICY_CHANGED"
+
+
+def resolve_runtime_fallback_reason(configured: str, transition: str) -> str:
+    if configured not in {"auto", "ws", "pull"}:
+        raise ValueError(f"invalid configured Runtime transport {configured!r}")
+    if transition in {
+        "websocket_to_long_poll",
+        "failed_websocket_probe_restore_long_poll",
+    }:
+        return "websocket_unavailable"
+    if transition == "long_poll_to_websocket":
+        return "recovery"
+    if transition in {
+        "policy_selected",
+        "same_transport_reconnect",
+        "policy_rediscovery",
+    }:
+        return "policy_forced" if configured == "auto" else "explicit"
+    raise ValueError(f"invalid Runtime fallback transition {transition!r}")
+
+
+async def runtime_policy_recover_once(
+    operation: Callable[[], Awaitable[Any]],
+    recover_policy: Callable[[BaseException], Awaitable[None]],
+) -> Any:
+    try:
+        return await operation()
+    except Exception as exc:
+        if not is_runtime_policy_recovery_signal(exc):
+            raise
+        await recover_policy(exc)
+        try:
+            return await operation()
+        except Exception as retry_error:
+            if not is_runtime_policy_recovery_signal(retry_error):
+                raise
+            error = RuntimePolicyRecoveryError(
+                RuntimeError("policy signal persisted after one canonical rediscovery")
+            )
+            raise error from retry_error
 
 
 def _require_response_keys(

@@ -7,9 +7,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from openlinker import runtime
-from openlinker.runtime.transport import ClaimedAssignment, RuntimeTransportPolicy
+import openlinker.runtime.worker as runtime_worker_module
+from openlinker.runtime.transport import (
+    ClaimedAssignment,
+    RuntimeDiscoveryConnection,
+    RuntimeTransportPolicy,
+)
 
 
 NODE_ID = "11111111-1111-4111-8111-111111111111"
@@ -95,9 +102,13 @@ class FakeTransport:
         self.call_release = asyncio.Event()
         self.call_release.set()
         self.call_cancelled = asyncio.Event()
+        self.fallback_reasons: list[str] = []
 
-    async def create_session(self, hello: dict[str, Any]) -> runtime.RuntimeReady:
+    async def create_session(
+        self, hello: dict[str, Any], *, fallback_reason: str = ""
+    ) -> runtime.RuntimeReady:
         del hello
+        self.fallback_reasons.append(fallback_reason)
         self.create_calls += 1
         if self.create_calls <= self.session_conflicts:
             raise runtime.RuntimeRemoteError(
@@ -277,6 +288,34 @@ def make_worker(
     )
     worker._transport = transport
     return worker
+
+
+def make_policy_worker(
+    store: runtime.MemoryRuntimeStore,
+    *,
+    platform_url: str = "https://platform.example.test",
+    runtime_url: str = "",
+    mode: str = "auto",
+) -> runtime.RuntimeWorker:
+    return runtime.RuntimeWorker(
+        platform_url=platform_url,
+        runtime_url=runtime_url,
+        node_id=NODE_ID,
+        agent_id=AGENT_ID,
+        agent_token="ol_agent_test",
+        mtls=runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+        store=store,
+        allow_unsafe_memory_store=True,
+        handler=lambda _context: {},
+        transport=mode,
+        claim_wait=0.02,
+        command_wait=0.02,
+        heartbeat_interval=10.0,
+        retry_minimum=0.005,
+        retry_maximum=0.01,
+        websocket_probe_interval=10.0,
+        shutdown_timeout=0.2,
+    )
 
 
 @pytest.mark.asyncio
@@ -890,9 +929,252 @@ def test_worker_applies_discovered_transport_selection_and_timings():
             default_transport="pull",
         )
     )
-    assert worker.transport_mode == "pull"
+    assert worker.transport_mode == "auto"
     assert worker._transport_order == ("pull",)
     assert not worker._auto_allows_pull_fallback()
+    assert worker.heartbeat_interval == 0.02
+    assert worker.retry_minimum == 0.005
+    assert worker.retry_maximum == 0.01
+    assert worker._session_stale_after == 0.0
+
+
+@pytest.mark.asyncio
+async def test_worker_coalesces_concurrent_policy_signals_into_one_rediscovery(
+    monkeypatch,
+):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    replacement_used = asyncio.Event()
+    failing_calls = 0
+    replacement_calls = 0
+    discovery_calls = 0
+    factory_calls = 0
+
+    def policy_signal() -> runtime.RuntimeRemoteError:
+        return runtime.RuntimeRemoteError("FORBIDDEN", "RUNTIME_POLICY_CHANGED", status_code=403)
+
+    class InitialPolicyTransport(FakeTransport):
+        async def _fail_together(self):
+            nonlocal failing_calls
+            failing_calls += 1
+            if failing_calls == 2:
+                entered.set()
+            await release.wait()
+            raise policy_signal()
+
+        async def claim_assignment(self, _wait, _request):
+            return await self._fail_together()
+
+        async def poll_commands(self, _session, _wait):
+            return await self._fail_together()
+
+    class ReplacementTransport(FakeTransport):
+        async def claim_assignment(self, wait_seconds, request):
+            nonlocal replacement_calls
+            replacement_calls += 1
+            if replacement_calls >= 2:
+                replacement_used.set()
+            return await super().claim_assignment(wait_seconds, request)
+
+        async def poll_commands(self, runtime_session_id, wait_seconds):
+            nonlocal replacement_calls
+            replacement_calls += 1
+            if replacement_calls >= 2:
+                replacement_used.set()
+            return await super().poll_commands(runtime_session_id, wait_seconds)
+
+    transports = [InitialPolicyTransport(), ReplacementTransport()]
+
+    async def discover(_platform_url):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return RuntimeDiscoveryConnection(
+            f"https://runtime-{discovery_calls}.example.test",
+            RuntimeTransportPolicy(("pull",), "auto"),
+        )
+
+    def build_http(*_args, **_kwargs):
+        nonlocal factory_calls
+        transport = transports[factory_calls]
+        factory_calls += 1
+        return transport
+
+    monkeypatch.setattr(runtime_worker_module, "discover_runtime_connection", discover)
+    monkeypatch.setattr(runtime_worker_module, "HTTPRuntimeTransport", build_http)
+    store = runtime.MemoryRuntimeStore()
+    worker = make_policy_worker(store)
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        identity = store.identity
+        release.set()
+        await asyncio.wait_for(replacement_used.wait(), timeout=1)
+        assert discovery_calls == 2
+        assert factory_calls == 2
+        assert store.identity == identity
+        assert transports[0].fallback_reasons == ["policy_forced"]
+        assert transports[1].fallback_reasons == ["policy_forced"]
+    finally:
+        await worker.stop()
+        await running
+
+
+@pytest.mark.asyncio
+async def test_worker_returns_second_policy_signal_without_another_rediscovery(monkeypatch):
+    discovery_calls = 0
+    factory_calls = 0
+
+    class AlwaysPolicyTransport(FakeTransport):
+        async def claim_assignment(self, _wait, _request):
+            raise runtime.RuntimeRemoteError(
+                "FORBIDDEN", "RUNTIME_TRANSPORT_FORBIDDEN", status_code=403
+            )
+
+    transports = [AlwaysPolicyTransport(), AlwaysPolicyTransport()]
+
+    async def discover(_platform_url):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return RuntimeDiscoveryConnection(
+            f"https://runtime-{discovery_calls}.example.test",
+            RuntimeTransportPolicy(("pull",), "auto"),
+        )
+
+    def build_http(*_args, **_kwargs):
+        nonlocal factory_calls
+        transport = transports[factory_calls]
+        factory_calls += 1
+        return transport
+
+    monkeypatch.setattr(runtime_worker_module, "discover_runtime_connection", discover)
+    monkeypatch.setattr(runtime_worker_module, "HTTPRuntimeTransport", build_http)
+    worker = make_policy_worker(runtime.MemoryRuntimeStore(), mode="pull")
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "OpenLinker Runtime policy recovery failed: "
+            "policy signal persisted after one canonical rediscovery"
+        ),
+    ) as terminal:
+        await asyncio.wait_for(worker.run(), timeout=1)
+    assert discovery_calls == 2
+    assert factory_calls == 2
+    later_operation_calls = 0
+
+    async def later_operation():
+        nonlocal later_operation_calls
+        later_operation_calls += 1
+
+    with pytest.raises(RuntimeError) as repeated:
+        await worker._policy_operation(later_operation)
+    assert repeated.value is terminal.value
+    assert later_operation_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_policy_recovery_fails_closed_without_platform_or_allowed_explicit_transport(
+    monkeypatch,
+):
+    class PolicyTransport(FakeTransport):
+        async def claim_assignment(self, _wait, _request):
+            raise runtime.RuntimeRemoteError("FORBIDDEN", "RUNTIME_POLICY_CHANGED", status_code=403)
+
+    without_platform = PolicyTransport()
+    monkeypatch.setattr(
+        runtime_worker_module,
+        "HTTPRuntimeTransport",
+        lambda *_args, **_kwargs: without_platform,
+    )
+    worker = make_policy_worker(
+        runtime.MemoryRuntimeStore(),
+        platform_url="",
+        runtime_url="https://runtime.example.test",
+        mode="pull",
+    )
+    with pytest.raises(RuntimeError, match="canonical rediscovery requires platform_url"):
+        await asyncio.wait_for(worker.run(), timeout=1)
+
+    discovery_calls = 0
+    factory_calls = 0
+
+    async def discover(_platform_url):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        allowed = ("pull",) if discovery_calls == 1 else ("ws",)
+        return RuntimeDiscoveryConnection(
+            f"https://runtime-{discovery_calls}.example.test",
+            RuntimeTransportPolicy(allowed, "auto"),
+        )
+
+    def build_http(*_args, **_kwargs):
+        nonlocal factory_calls
+        factory_calls += 1
+        return PolicyTransport()
+
+    monkeypatch.setattr(runtime_worker_module, "discover_runtime_connection", discover)
+    monkeypatch.setattr(runtime_worker_module, "HTTPRuntimeTransport", build_http)
+    incompatible = make_policy_worker(runtime.MemoryRuntimeStore(), mode="pull")
+    with pytest.raises(RuntimeError, match="configured Runtime transport 'pull' is not allowed"):
+        await asyncio.wait_for(incompatible.run(), timeout=1)
+    assert discovery_calls == 2
+    assert factory_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_rediscovers_once_on_established_websocket_policy_close(monkeypatch):
+    discovery_calls = 0
+    socket_calls = 0
+    close_socket = asyncio.Event()
+    recovered = asyncio.Event()
+    connect_reasons: list[str] = []
+
+    class PolicyWebSocket(FakeTransport):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__(kind="ws")
+            nonlocal socket_calls
+            self.index = socket_calls
+            socket_calls += 1
+
+        async def connect(self, _hello, *, fallback_reason=""):
+            connect_reasons.append(fallback_reason)
+            if self.index == 1:
+                recovered.set()
+            return ready()
+
+        async def claim_assignment(self, wait_seconds, request):
+            if self.index == 0:
+                await close_socket.wait()
+                raise ConnectionClosedError(Close(1008, "RUNTIME_POLICY_CHANGED"), None)
+            return await super().claim_assignment(wait_seconds, request)
+
+    async def discover(_platform_url):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return RuntimeDiscoveryConnection(
+            f"https://runtime-{discovery_calls}.example.test",
+            RuntimeTransportPolicy(("ws",), "auto"),
+        )
+
+    monkeypatch.setattr(runtime_worker_module, "discover_runtime_connection", discover)
+    monkeypatch.setattr(
+        runtime_worker_module,
+        "HTTPRuntimeTransport",
+        lambda *_args, **_kwargs: FakeTransport(),
+    )
+    monkeypatch.setattr(runtime_worker_module, "WebSocketRuntimeTransport", PolicyWebSocket)
+    worker = make_policy_worker(runtime.MemoryRuntimeStore())
+    running = asyncio.create_task(worker.run())
+    try:
+        while socket_calls < 1:
+            await asyncio.sleep(0)
+        close_socket.set()
+        await asyncio.wait_for(recovered.wait(), timeout=1)
+        assert discovery_calls == 2
+        assert socket_calls == 2
+        assert connect_reasons == ["policy_forced", "policy_forced"]
+    finally:
+        await worker.stop()
+        await running
 
 
 @pytest.mark.asyncio

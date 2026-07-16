@@ -33,6 +33,10 @@ from .types import (
 _DISCOVERY_PATH = "/.well-known/openlinker.json"
 _SDK_AGENT = "openlinker-python/runtime-worker"
 _ATTACHMENT_HEADER = "OpenLinker-Runtime-Attachment"
+RUNTIME_FALLBACK_REASON_HEADER = "OpenLinker-Runtime-Fallback-Reason"
+RUNTIME_FALLBACK_REASONS = frozenset(
+    {"explicit", "websocket_unavailable", "policy_forced", "recovery"}
+)
 _ERROR_CODES = {
     "BAD_REQUEST",
     "UNAUTHORIZED",
@@ -94,7 +98,9 @@ class RuntimeDiscoveryConnection:
 class RuntimeTransport(Protocol):
     kind: str
 
-    async def create_session(self, hello: dict[str, Any]) -> RuntimeReady: ...
+    async def create_session(
+        self, hello: dict[str, Any], *, fallback_reason: str = ""
+    ) -> RuntimeReady: ...
 
     async def heartbeat_session(self, hello: dict[str, Any]) -> RuntimeReady: ...
 
@@ -256,9 +262,7 @@ def decode_runtime_transport_policy(runtime: dict[str, Any]) -> RuntimeTransport
     stale_after = _optional_policy_duration(raw_policy, "session_stale_after_seconds", 1.0)
     retry_minimum = _optional_policy_duration(raw_policy, "retry_minimum_ms", 0.001)
     retry_maximum = _optional_policy_duration(raw_policy, "retry_maximum_ms", 0.001)
-    probe_interval = _optional_policy_duration(
-        raw_policy, "websocket_probe_interval_ms", 0.001
-    )
+    probe_interval = _optional_policy_duration(raw_policy, "websocket_probe_interval_ms", 0.001)
     probe_timeout = _optional_policy_duration(raw_policy, "websocket_probe_timeout_ms", 0.001)
     if (retry_maximum if retry_maximum is not None else 15.0) < (
         retry_minimum if retry_minimum is not None else 0.25
@@ -360,13 +364,21 @@ class HTTPRuntimeTransport:
                 trust_env=False,
             )
 
-    async def create_session(self, hello: dict[str, Any]) -> RuntimeReady:
+    async def create_session(
+        self, hello: dict[str, Any], *, fallback_reason: str = ""
+    ) -> RuntimeReady:
+        _validate_fallback_reason(fallback_reason)
         async with self._attachment_transition:
             ready = RuntimeReady.from_dict(
                 await self._request(
                     "POST",
                     "/api/v1/agent-runtime/sessions",
                     body=hello,
+                    headers=(
+                        {RUNTIME_FALLBACK_REASON_HEADER: fallback_reason}
+                        if fallback_reason
+                        else None
+                    ),
                     use_attachment=False,
                 )
             )
@@ -603,9 +615,10 @@ class WebSocketRuntimeTransport:
         self._closed = asyncio.Event()
         self._closed_error: Exception | None = None
 
-    async def connect(self, hello: dict[str, Any]) -> RuntimeReady:
+    async def connect(self, hello: dict[str, Any], *, fallback_reason: str = "") -> RuntimeReady:
         if self._socket is not None:
             raise RuntimeError("Runtime WebSocket is already connected")
+        _validate_fallback_reason(fallback_reason)
         parsed = urlparse(self.runtime_origin)
         uri = urlunparse(parsed._replace(scheme="wss", path=RUNTIME_WEBSOCKET_PATH))
         ssl_context = build_runtime_ssl_context(self._mtls)
@@ -625,9 +638,17 @@ class WebSocketRuntimeTransport:
             "Authorization": f"Bearer {self._agent_token}",
             "X-OpenLinker-SDK": _SDK_AGENT,
         }
+        if fallback_reason:
+            kwargs[header_name][RUNTIME_FALLBACK_REASON_HEADER] = fallback_reason
         if self._mtls.server_name:
             kwargs["server_hostname"] = self._mtls.server_name
-        self._socket = await websockets.connect(uri, **kwargs)
+        try:
+            self._socket = await websockets.connect(uri, **kwargs)
+        except Exception as exc:
+            translated = _websocket_upgrade_error(exc)
+            if translated is not None:
+                raise translated from exc
+            raise
         self._hello = dict(hello)
         hello_id = await self._send_envelope("runtime.hello", hello)
         try:
@@ -647,7 +668,10 @@ class WebSocketRuntimeTransport:
         self._reader = asyncio.create_task(self._read_loop())
         return self._ready
 
-    async def create_session(self, hello: dict[str, Any]) -> RuntimeReady:
+    async def create_session(
+        self, hello: dict[str, Any], *, fallback_reason: str = ""
+    ) -> RuntimeReady:
+        _validate_fallback_reason(fallback_reason)
         if self._ready is None or self._hello != hello:
             raise RuntimeProtocolError("Runtime WebSocket is attached to another Session")
         return self._ready
@@ -1111,12 +1135,47 @@ def _validate_origin(value: str, *, runtime: bool) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
 
 
+def _validate_fallback_reason(reason: str) -> None:
+    if reason and reason not in RUNTIME_FALLBACK_REASONS:
+        raise ValueError(f"invalid Runtime fallback reason {reason!r}")
+
+
+def _websocket_upgrade_error(exc: BaseException) -> RuntimeRemoteError | None:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is None:
+        status_code = getattr(exc, "status_code", None)
+    body = getattr(response, "body", None)
+    if not isinstance(status_code, int) or body is None:
+        return None
+    if isinstance(body, str):
+        raw = body.encode()
+    elif isinstance(body, (bytes, bytearray, memoryview)):
+        raw = bytes(body)
+    else:
+        return None
+    if len(raw) > 64 * 1024:
+        return None
+    try:
+        envelope = _strict_object(raw, "Runtime WebSocket upgrade error")
+        if set(envelope) != {"error"}:
+            return None
+        return _parse_error_body(
+            _require_dict(envelope.get("error"), "Runtime WebSocket upgrade error"),
+            status_code=status_code,
+        )
+    except RuntimeProtocolError:
+        return None
+
+
 __all__ = [
     "ClaimedAssignment",
     "HTTPRuntimeTransport",
     "RuntimeTransport",
     "RuntimeDiscoveryConnection",
     "RuntimeTransportPolicy",
+    "RUNTIME_FALLBACK_REASON_HEADER",
+    "RUNTIME_FALLBACK_REASONS",
     "WebSocketRuntimeTransport",
     "decode_runtime_discovery_manifest",
     "decode_runtime_transport_policy",
