@@ -15,6 +15,7 @@ import openlinker.runtime.worker as runtime_worker_module
 from openlinker.runtime.transport import (
     ClaimedAssignment,
     RuntimeDiscoveryConnection,
+    RuntimeTransport,
     RuntimeTransportPolicy,
 )
 
@@ -104,6 +105,13 @@ class FakeTransport:
         self.call_cancelled = asyncio.Event()
         self.fallback_reasons: list[str] = []
 
+        self.drain_calls: list[dict[str, Any]] = []
+        self.drain_entered = asyncio.Event()
+        self.drain_release = asyncio.Event()
+        self.drain_release.set()
+        self.drain_cancelled = asyncio.Event()
+        self.drain_handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+
     async def create_session(
         self, hello: dict[str, Any], *, fallback_reason: str = ""
     ) -> runtime.RuntimeReady:
@@ -122,6 +130,20 @@ class FakeTransport:
         if error is not None:
             raise error
         return ready(lease_ttl_seconds=self.lease_ttl_seconds)
+
+    async def drain_session(
+        self, runtime_session_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.drain_calls.append(dict(request))
+        self.drain_entered.set()
+        try:
+            await self.drain_release.wait()
+        except asyncio.CancelledError:
+            self.drain_cancelled.set()
+            raise
+        if self.drain_handler is not None:
+            return await self.drain_handler(runtime_session_id, request)
+        return {**request, "capacity": 0, "inflight": 0}
 
     async def close_session(self, request: dict[str, Any]) -> None:
         del request
@@ -1239,6 +1261,303 @@ async def test_shutdown_timeout_cancels_without_fabricating_a_result(tmp_path: P
         assert reopened.assignments()[0].state == "started"
     finally:
         reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_core_fence_handler_and_durable_spool_ack():
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    transport.assignment = assignment(store)
+    transport.drain_release.clear()
+    handler_started = asyncio.Event()
+    release_handler = asyncio.Event()
+    transport.result_release.clear()
+    drain_count = 0
+
+    async def authoritative_drain(
+        runtime_session_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        nonlocal drain_count
+        assert runtime_session_id == store.identity.runtime_session_id
+        drain_count += 1
+        return {
+            **request,
+            "deadline_at": (
+                datetime.fromisoformat(str(request["deadline_at"]).replace("Z", "+00:00"))
+                - timedelta(seconds=1)
+            ).isoformat(),
+            "reason_code": "FIRST_WRITER_REASON",
+            "capacity": 0,
+            "inflight": 1 if drain_count == 1 else 0,
+        }
+
+    transport.drain_handler = authoritative_drain
+
+    async def handler(_context: runtime.RuntimeContext) -> dict[str, Any]:
+        handler_started.set()
+        await release_handler.wait()
+        return {"drained": True}
+
+    worker = make_worker(store, transport, handler, shutdown_timeout=1)
+    running = asyncio.create_task(worker.run())
+    await asyncio.wait_for(handler_started.wait(), timeout=1)
+    draining = asyncio.create_task(worker.drain(timeout=2, reason_code="DEPLOYMENT"))
+    await asyncio.wait_for(transport.drain_entered.wait(), timeout=1)
+    assert worker._draining
+    assert worker._capacity_snapshot() == (0, 1)
+    assert not draining.done()
+    transport.drain_release.set()
+    await asyncio.sleep(0.02)
+    assert not draining.done()
+    release_handler.set()
+    await asyncio.wait_for(transport.result_entered.wait(), timeout=1)
+    assert not draining.done()
+    transport.result_release.set()
+    await asyncio.wait_for(draining, timeout=2)
+    await running
+
+    assert drain_count >= 2
+    assert transport.drain_calls[0]["reason_code"] == "DEPLOYMENT"
+    assert transport.drain_calls[0]["capacity"] == 0
+    assert transport.drain_calls[0]["inflight"] == 1
+    assert transport.session_closed
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_fails_closed_and_preserves_durable_spool(tmp_path: Path):
+    data_dir = tmp_path / "runtime-drain"
+    store = runtime.FileRuntimeStore(data_dir)
+    transport = FakeTransport()
+    transport.assignment = assignment(store)
+    transport.result_upload_available = False
+    result_started = asyncio.Event()
+
+    async def handler(context: runtime.RuntimeContext) -> dict[str, Any]:
+        await context.emit("run.progress", {"phase": "durable"})
+        result_started.set()
+        return {"pending": True}
+
+    worker = make_worker(store, transport, handler, shutdown_timeout=0.05)
+    running = asyncio.create_task(worker.run())
+    await asyncio.wait_for(result_started.wait(), timeout=1)
+    await asyncio.wait_for(transport.result_entered.wait(), timeout=1)
+    with pytest.raises(runtime.RuntimeDrainTimeoutError) as raised:
+        await worker.drain(timeout=0.04)
+    assert raised.value.spool == runtime.RuntimeSpoolStatus(assignments=1, events=1, results=1)
+    await asyncio.wait_for(running, timeout=2)
+
+    reopened = runtime.FileRuntimeStore(data_dir)
+    try:
+        assert reopened.spool_status() == runtime.RuntimeSpoolStatus(
+            assignments=1, events=1, results=1
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_cancels_blocked_core_request_and_fails_closed():
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    transport.drain_release.clear()
+    worker = make_worker(store, transport, lambda _context: {"unused": True})
+    running = asyncio.create_task(worker.run())
+    while worker._ready is None:
+        await asyncio.sleep(0)
+    with pytest.raises(runtime.RuntimeDrainTimeoutError) as raised:
+        await worker.drain(timeout=0.02)
+    assert raised.value.spool.empty
+    await asyncio.wait_for(transport.drain_cancelled.wait(), timeout=1)
+    await running
+
+
+@pytest.mark.asyncio
+async def test_cancelled_drain_caller_does_not_cancel_singleflight_operation():
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    transport.drain_release.clear()
+    worker = make_worker(store, transport, lambda _context: {"unused": True})
+    running = asyncio.create_task(worker.run())
+    while worker._ready is None:
+        await asyncio.sleep(0)
+    first = asyncio.create_task(worker.drain(timeout=1))
+    await asyncio.wait_for(transport.drain_entered.wait(), timeout=1)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert not worker._stopping.is_set()
+    follower = asyncio.create_task(worker.drain(timeout=1))
+    transport.drain_release.set()
+    await follower
+    await running
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_attach_and_retries_transport_switch():
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    attach_entered = asyncio.Event()
+    release_attach = asyncio.Event()
+    original_create = transport.create_session
+    attempts = 0
+
+    async def blocked_create(
+        hello: dict[str, Any], *, fallback_reason: str = ""
+    ) -> runtime.RuntimeReady:
+        attach_entered.set()
+        await release_attach.wait()
+        return await original_create(hello, fallback_reason=fallback_reason)
+
+    async def switched_drain(_session_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError("Runtime transport is switching")
+        return {**request, "capacity": 0, "inflight": 0}
+
+    transport.create_session = blocked_create  # type: ignore[method-assign]
+    transport.drain_handler = switched_drain
+    worker = make_worker(store, transport, lambda _context: {"unused": True})
+    running = asyncio.create_task(worker.run())
+    await asyncio.wait_for(attach_entered.wait(), timeout=1)
+    draining = asyncio.create_task(worker.drain(timeout=1))
+    await asyncio.sleep(0.02)
+    assert not draining.done()
+    release_attach.set()
+    await asyncio.wait_for(draining, timeout=2)
+    await running
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_drain_cannot_succeed_when_stop_wins_after_final_evidence():
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    worker = make_worker(store, transport, lambda _context: {"unused": True})
+    proof_reached = asyncio.Event()
+    release_proof = asyncio.Event()
+
+    async def barrier() -> None:
+        proof_reached.set()
+        await release_proof.wait()
+
+    worker._drain_before_stop = barrier
+    running = asyncio.create_task(worker.run())
+    while worker._ready is None:
+        await asyncio.sleep(0)
+    draining = asyncio.create_task(worker.drain(timeout=1))
+    await asyncio.wait_for(proof_reached.wait(), timeout=1)
+    stopping = asyncio.create_task(worker.stop())
+    await asyncio.wait_for(worker._stopping.wait(), timeout=1)
+    assert worker._stop_owner == "external"
+    release_proof.set()
+    with pytest.raises(RuntimeError, match="stopped before its durable drain completed"):
+        await draining
+    await stopping
+    await running
+
+
+@pytest.mark.asyncio
+async def test_drain_rejects_every_malformed_core_ack():
+    invalid_responses = [
+        {
+            "deadline_at": datetime.now(timezone.utc).isoformat(),
+            "reason_code": "DEPLOYMENT",
+            "capacity": 0,
+            "inflight": 0,
+            "extra": True,
+        },
+        {
+            "deadline_at": datetime.now(timezone.utc).isoformat(),
+            "reason_code": "DEPLOYMENT",
+            "capacity": 1,
+            "inflight": 0,
+        },
+        {
+            "deadline_at": datetime.now(timezone.utc).isoformat(),
+            "reason_code": "DEPLOYMENT",
+            "capacity": 0,
+            "inflight": True,
+        },
+        {
+            "deadline_at": datetime.now(timezone.utc).isoformat(),
+            "reason_code": "",
+            "capacity": 0,
+            "inflight": 0,
+        },
+        {
+            "deadline_at": "not-a-timestamp",
+            "reason_code": "DEPLOYMENT",
+            "capacity": 0,
+            "inflight": 0,
+        },
+    ]
+    for invalid in invalid_responses:
+        store = runtime.MemoryRuntimeStore()
+        transport = FakeTransport()
+
+        async def invalid_ack(
+            _runtime_session_id: str,
+            _request: dict[str, Any],
+            response: dict[str, Any] = invalid,
+        ) -> dict[str, Any]:
+            return response
+
+        transport.drain_handler = invalid_ack
+        worker = make_worker(store, transport, lambda _context: {"unused": True})
+        running = asyncio.create_task(worker.run())
+        while worker._ready is None:
+            await asyncio.sleep(0)
+        with pytest.raises(runtime.RuntimeProtocolError):
+            await worker.drain(timeout=1)
+        await running
+
+
+@pytest.mark.asyncio
+async def test_drain_preserves_legacy_custom_store_and_transport_extensions():
+    assert "drain_session" not in RuntimeTransport.__dict__
+
+    class LegacyStore:
+        def __init__(self) -> None:
+            self.inner = runtime.MemoryRuntimeStore()
+
+        def __getattr__(self, name: str) -> Any:
+            if name == "spool_status":
+                raise AttributeError(name)
+            return getattr(self.inner, name)
+
+    class LegacyTransport:
+        def __init__(self) -> None:
+            self.inner = FakeTransport()
+            self.kind = self.inner.kind
+
+        def __getattr__(self, name: str) -> Any:
+            if name == "drain_session":
+                raise AttributeError(name)
+            return getattr(self.inner, name)
+
+    legacy_store = LegacyStore()
+    transport = FakeTransport()
+    worker = make_worker(legacy_store, transport, lambda _context: {"unused": True})  # type: ignore[arg-type]
+    running = asyncio.create_task(worker.run())
+    while worker._ready is None:
+        await asyncio.sleep(0)
+    await worker.drain(timeout=1)
+    await running
+
+    store = runtime.MemoryRuntimeStore()
+    legacy_transport = LegacyTransport()
+    legacy_worker = make_worker(
+        store,
+        legacy_transport,  # type: ignore[arg-type]
+        lambda _context: {"unused": True},
+    )
+    legacy_running = asyncio.create_task(legacy_worker.run())
+    while legacy_worker._ready is None:
+        await asyncio.sleep(0)
+    with pytest.raises(runtime.RuntimeProtocolError, match="does not implement session drain"):
+        await legacy_worker.drain(timeout=1)
+    await legacy_running
 
 
 def test_memory_store_requires_an_explicit_unsafe_opt_in():

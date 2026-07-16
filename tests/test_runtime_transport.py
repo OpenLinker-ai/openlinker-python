@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from openlinker.runtime.worker import (
 
 ATTACHMENT_ID = "88888888-8888-4888-8888-888888888888"
 NEXT_ATTACHMENT_ID = "99999999-9999-4999-8999-999999999999"
+RUNTIME_SESSION_ID = "33333333-3333-4333-8333-333333333333"
 
 
 def test_runtime_discovery_policy_fixtures_are_language_consistent():
@@ -219,6 +221,132 @@ async def test_http_runtime_uses_canonical_unversioned_path_and_agent_token():
     assert seen[2].headers["OpenLinker-Runtime-Attachment"] == ATTACHMENT_ID
     assert "OpenLinker-Runtime-Fallback-Reason" not in seen[1].headers
     assert "OpenLinker-Runtime-Fallback-Reason" not in seen[2].headers
+
+
+@pytest.mark.asyncio
+async def test_http_runtime_drain_uses_attachment_and_authoritative_ack():
+    seen: list[httpx.Request] = []
+    requested_deadline = datetime.now(timezone.utc).isoformat()
+    authoritative_deadline = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/api/v1/agent-runtime/sessions":
+            return httpx.Response(200, json=ready_payload())
+        assert request.url.path == (f"/api/v1/agent-runtime/sessions/{RUNTIME_SESSION_ID}/drain")
+        assert json.loads(request.content) == {
+            "deadline_at": requested_deadline,
+            "reason_code": "DEPLOYMENT",
+            "capacity": 0,
+            "inflight": 2,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "deadline_at": authoritative_deadline,
+                "reason_code": "FIRST_WRITER_REASON",
+                "capacity": 0,
+                "inflight": 1,
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = HTTPRuntimeTransport(
+            "https://runtime.example.test",
+            "ol_agent_secret",
+            runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            _client=client,
+        )
+        await transport.create_session({"runtime_session_id": RUNTIME_SESSION_ID})
+        response = await transport.drain_session(
+            RUNTIME_SESSION_ID,
+            {
+                "deadline_at": requested_deadline,
+                "reason_code": "DEPLOYMENT",
+                "capacity": 0,
+                "inflight": 2,
+            },
+        )
+
+    assert response["deadline_at"] == authoritative_deadline
+    assert response["reason_code"] == "FIRST_WRITER_REASON"
+    assert response["inflight"] == 1
+    assert seen[1].headers["OpenLinker-Runtime-Attachment"] == ATTACHMENT_ID
+
+
+@pytest.mark.asyncio
+async def test_websocket_runtime_drain_uses_correlated_bidirectional_ack():
+    sent: list[dict[str, object]] = []
+
+    class DrainSocket:
+        def __init__(self) -> None:
+            self.incoming: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> str:
+            value = await self.incoming.get()
+            if value is None:
+                raise StopAsyncIteration
+            return value
+
+        async def send(self, raw: str) -> None:
+            envelope = json.loads(raw)
+            sent.append(envelope)
+            await self.incoming.put(
+                json.dumps(
+                    {
+                        "protocol_version": runtime.RUNTIME_PROTOCOL_VERSION,
+                        "runtime_contract_id": runtime.RUNTIME_CONTRACT_ID,
+                        "message_id": str(uuid.uuid4()),
+                        "reply_to_message_id": envelope["message_id"],
+                        "type": "runtime.drain",
+                        "sent_at": datetime.now(timezone.utc).isoformat(),
+                        "payload": {
+                            **envelope["payload"],
+                            "reason_code": "FIRST_WRITER_REASON",
+                            "inflight": 0,
+                        },
+                    }
+                )
+            )
+
+        async def close(self) -> None:
+            await self.incoming.put(None)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(204))
+    ) as client:
+        http = HTTPRuntimeTransport(
+            "https://runtime.example.test",
+            "ol_agent_secret",
+            runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            _client=client,
+        )
+        websocket = WebSocketRuntimeTransport(
+            "https://runtime.example.test",
+            "ol_agent_secret",
+            runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            http,
+        )
+        socket = DrainSocket()
+        websocket._socket = socket
+        websocket._hello = {"runtime_session_id": RUNTIME_SESSION_ID}
+        websocket._ready = runtime.RuntimeReady.from_dict(ready_payload())
+        websocket._reader = asyncio.create_task(websocket._read_loop())
+        request = {
+            "deadline_at": datetime.now(timezone.utc).isoformat(),
+            "reason_code": "DEPLOYMENT",
+            "capacity": 0,
+            "inflight": 0,
+        }
+        response = await websocket.drain_session(RUNTIME_SESSION_ID, request)
+        await websocket.close()
+
+    assert sent[0]["type"] == "runtime.drain"
+    assert sent[0]["payload"] == request
+    assert response["reason_code"] == "FIRST_WRITER_REASON"
 
 
 @pytest.mark.asyncio

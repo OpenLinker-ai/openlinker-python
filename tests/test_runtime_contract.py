@@ -26,6 +26,7 @@ def test_runtime_contract_matches_constants_and_has_unversioned_urls():
     expected = {
         "POST /api/v1/agent-runtime/sessions",
         "POST /api/v1/agent-runtime/sessions/{id}/heartbeat",
+        "POST /api/v1/agent-runtime/sessions/{id}/drain",
         "POST /api/v1/agent-runtime/sessions/{id}/close",
         "POST /api/v1/agent-runtime/runs/claim",
         "POST /api/v1/agent-runtime/runs/{id}/assignment-ack",
@@ -56,6 +57,28 @@ def test_runtime_contract_matches_constants_and_has_unversioned_urls():
     ready_schema = contract["$defs"]["RuntimeReadyPayload"]
     assert "attachment_id" in ready_schema["required"]
     assert ready_schema["properties"]["attachment_id"]["format"] == "uuid"
+    drain_endpoint = next(
+        item
+        for item in contract["endpoints"]
+        if item["path"] == "/api/v1/agent-runtime/sessions/{id}/drain"
+    )
+    assert drain_endpoint["client_method"] == "drainRuntimeSession"
+    assert drain_endpoint["request_body_schema"] == {"$ref": "#/$defs/RuntimeDrainPayload"}
+    assert drain_endpoint["success_response_schema"] == {"$ref": "#/$defs/RuntimeDrainPayload"}
+    drain_schema = contract["$defs"]["RuntimeDrainPayload"]
+    assert drain_schema["additionalProperties"] is False
+    assert drain_schema["properties"]["capacity"] == {"const": 0}
+    assert set(drain_schema["required"]) == {
+        "deadline_at",
+        "reason_code",
+        "capacity",
+        "inflight",
+    }
+    drain_message = next(
+        item for item in contract["websocket"]["messages"] if item["type"] == "runtime.drain"
+    )
+    assert drain_message["direction"] == "bidirectional"
+    assert drain_message["expects_reply"] is True
 
 
 def test_contract_is_byte_identical_to_the_canonical_core_copy():

@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 RUNTIME_PROTOCOL_VERSION = 2
 RUNTIME_CONTRACT_ID = "openlinker.runtime.v2"
-RUNTIME_CONTRACT_DIGEST = "3f84df167bbe211efdc6362ad5ec876aeedf881cbfb9677606982af63c7423e9"
+RUNTIME_CONTRACT_DIGEST = "4be9b2fe09eeedf0e37119075134064be88f93b301c502cdfa21a6cb978c6481"
 RUNTIME_REQUIRED_FEATURES = (
     "lease_fence",
     "assignment_confirm",
@@ -23,6 +23,7 @@ RUNTIME_REQUIRED_FEATURES = (
     "result_ack",
     "cancel",
     "persistent_spool",
+    "session_drain",
 )
 
 RUNTIME_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
@@ -75,6 +76,34 @@ class RuntimeStoreLocked(RuntimeStoreError):
 
 class RuntimeStoreCapacity(RuntimeStoreError):
     pass
+
+
+@dataclass(frozen=True)
+class RuntimeSpoolStatus:
+    """Durable records that must be ACKed before a Worker can exit safely."""
+
+    assignments: int
+    events: int
+    results: int
+
+    @property
+    def empty(self) -> bool:
+        return self.assignments == 0 and self.events == 0 and self.results == 0
+
+
+class RuntimeDrainTimeoutError(RuntimeError):
+    """A drain failed closed while durable Runtime work was still pending."""
+
+    code = "RUNTIME_DRAIN_TIMEOUT"
+
+    def __init__(self, timeout: float, spool: RuntimeSpoolStatus) -> None:
+        self.timeout = timeout
+        self.spool = spool
+        super().__init__(
+            "OpenLinker Runtime Worker drain timed out after "
+            f"{timeout:g}s with {spool.assignments} assignment(s), "
+            f"{spool.events} Event(s), and {spool.results} Result(s) still durable"
+        )
 
 
 @dataclass(frozen=True)
@@ -409,6 +438,33 @@ def format_datetime(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def validate_runtime_drain_payload(value: Any) -> dict[str, Any]:
+    """Validate the exact bidirectional ``runtime.drain`` wire payload."""
+
+    if not isinstance(value, dict):
+        raise RuntimeProtocolError("Runtime drain payload must be a JSON object")
+    _require_keys(
+        value,
+        required={"deadline_at", "reason_code", "capacity", "inflight"},
+        optional=set(),
+        name="Runtime drain payload",
+    )
+    try:
+        parse_datetime(value["deadline_at"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeProtocolError("Runtime drain deadline is invalid") from exc
+    reason_code = value["reason_code"]
+    if not isinstance(reason_code, str) or not 1 <= len(reason_code) <= 120:
+        raise RuntimeProtocolError("Runtime drain reason is invalid")
+    capacity = value["capacity"]
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity != 0:
+        raise RuntimeProtocolError("Runtime drain capacity is invalid")
+    inflight = value["inflight"]
+    if not isinstance(inflight, int) or isinstance(inflight, bool) or inflight < 0:
+        raise RuntimeProtocolError("Runtime drain inflight is invalid")
+    return dict(value)
+
+
 def _require_uuid(value: str, name: str) -> None:
     try:
         parsed = uuid.UUID(value)
@@ -467,6 +523,7 @@ __all__ = [
     "RuntimeAttemptIdentity",
     "RuntimeCallOptions",
     "RuntimeCommand",
+    "RuntimeDrainTimeoutError",
     "RuntimeEvent",
     "RuntimeHandlerError",
     "RuntimeMTLS",
@@ -474,6 +531,7 @@ __all__ = [
     "RuntimeReady",
     "RuntimeRemoteError",
     "RuntimeResult",
+    "RuntimeSpoolStatus",
     "RuntimeStoreCapacity",
     "RuntimeStoreCorrupt",
     "RuntimeStoreError",

@@ -26,6 +26,7 @@ from .types import (
     build_invocation_proof,
     format_datetime,
     parse_datetime,
+    validate_runtime_drain_payload,
     wire_json_bytes,
 )
 
@@ -403,6 +404,20 @@ class HTTPRuntimeTransport:
                 )
             return ready
 
+    async def drain_session(
+        self, runtime_session_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        request = validate_runtime_drain_payload(request)
+        runtime_session_id = _runtime_session_id(runtime_session_id)
+        async with self._attachment_transition:
+            session_id = quote(runtime_session_id, safe="")
+            response = await self._request(
+                "POST",
+                f"/api/v1/agent-runtime/sessions/{session_id}/drain",
+                body=request,
+            )
+        return validate_runtime_drain_payload(response)
+
     async def close_session(self, request: dict[str, Any]) -> None:
         async with self._attachment_transition:
             session_id = quote(str(request["runtime_session_id"]), safe="")
@@ -691,6 +706,16 @@ class WebSocketRuntimeTransport:
             if hello.get(key) != self._hello.get(key):
                 raise RuntimeProtocolError("Runtime WebSocket heartbeat identity mismatch")
         return self._ready
+
+    async def drain_session(
+        self, runtime_session_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        request = validate_runtime_drain_payload(request)
+        runtime_session_id = _runtime_session_id(runtime_session_id)
+        if self._hello is None or runtime_session_id != self._hello.get("runtime_session_id"):
+            raise RuntimeProtocolError("Runtime WebSocket drain Session mismatch")
+        response = await self._request_one("runtime.drain", request, "runtime.drain")
+        return validate_runtime_drain_payload(response)
 
     async def close_session(self, request: dict[str, Any]) -> None:
         if self._hello is not None:
@@ -1138,6 +1163,18 @@ def _validate_origin(value: str, *, runtime: bool) -> str:
 def _validate_fallback_reason(reason: str) -> None:
     if reason and reason not in RUNTIME_FALLBACK_REASONS:
         raise ValueError(f"invalid Runtime fallback reason {reason!r}")
+
+
+def _runtime_session_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise RuntimeProtocolError("Runtime Session identity is invalid")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as exc:
+        raise RuntimeProtocolError("Runtime Session identity is invalid") from exc
+    if parsed.int == 0 or str(parsed) != value:
+        raise RuntimeProtocolError("Runtime Session identity is invalid")
+    return value
 
 
 def _websocket_upgrade_error(exc: BaseException) -> RuntimeRemoteError | None:

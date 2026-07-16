@@ -21,6 +21,7 @@ from .types import (
     RuntimeStoreCorrupt,
     RuntimeStoreError,
     RuntimeStoreLocked,
+    RuntimeSpoolStatus,
     deterministic_uuid,
     format_datetime,
     parse_datetime,
@@ -366,6 +367,17 @@ class MemoryRuntimeStore:
         with self._lock:
             self._ready()
             return [_copy_assignment(item) for item in self._assignments.values()]
+
+    def spool_status(self) -> RuntimeSpoolStatus:
+        """Return a lock-consistent snapshot without expanding RuntimeStore."""
+
+        with self._lock:
+            self._ready()
+            return RuntimeSpoolStatus(
+                assignments=len(self._assignments),
+                events=sum(len(records) for records in self._events.values()),
+                results=len(self._results),
+            )
 
     def delete_assignment(self, message_id: str) -> None:
         with self._lock:

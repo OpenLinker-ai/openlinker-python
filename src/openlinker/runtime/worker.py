@@ -5,10 +5,11 @@ import inspect
 import logging
 import random
 import time
+import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -44,6 +45,7 @@ from .transport import (
 from .types import (
     RUNTIME_MAX_CAPACITY,
     RuntimeAttemptIdentity,
+    RuntimeDrainTimeoutError,
     RuntimeEvent,
     RuntimeHandlerError,
     RuntimeMTLS,
@@ -51,10 +53,13 @@ from .types import (
     RuntimeReady,
     RuntimeRemoteError,
     RuntimeResult,
+    RuntimeSpoolStatus,
     RuntimeStoreError,
+    format_datetime,
     parse_datetime,
     runtime_hello,
     validate_idempotency_key,
+    validate_runtime_drain_payload,
 )
 
 
@@ -65,6 +70,9 @@ DEFAULT_HEARTBEAT_INTERVAL = 5.0
 DEFAULT_RETRY_MINIMUM = 0.25
 DEFAULT_RETRY_MAXIMUM = 15.0
 DEFAULT_SHUTDOWN_TIMEOUT = 10.0
+DEFAULT_DRAIN_TIMEOUT = 10.0
+MAXIMUM_DRAIN_TIMEOUT = 300.0
+DEFAULT_DRAIN_REASON = "SDK_GRACEFUL_SHUTDOWN"
 DEFAULT_NODE_VERSION = "openlinker-python/runtime-worker"
 
 _PERMANENT_CODES = {
@@ -77,6 +85,11 @@ _PERMANENT_CODES = {
     "RUNTIME_SPOOL_CORRUPT",
 }
 _LEASE_TERMINAL_CODES = {"STALE_LEASE", "LEASE_EXPIRED", "RUN_ALREADY_TERMINAL"}
+
+
+class _RuntimeStoppedBeforeDrain(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("RuntimeWorker stopped before its durable drain completed")
 
 
 class RuntimeHandler(Protocol):
@@ -252,6 +265,9 @@ class RuntimeWorker:
         self._stopping = asyncio.Event()
         self._force_cancel = asyncio.Event()
         self._draining = False
+        self._drain_task: asyncio.Task[None] | None = None
+        self._drain_before_stop: Callable[[], Awaitable[None] | None] | None = None
+        self._stop_owner: str | None = None
         self._fatal: asyncio.Queue[BaseException] = asyncio.Queue(maxsize=1)
         self._spool_wakeup = asyncio.Event()
         self._store: RuntimeStore | None = store
@@ -314,9 +330,170 @@ class RuntimeWorker:
     async def stop(self) -> None:
         if not self._started:
             return
-        self._draining = True
-        self._stopping.set()
+        self._request_stop("external")
         await self._done.wait()
+
+    async def drain(
+        self,
+        *,
+        timeout: float | None = None,
+        reason_code: str = DEFAULT_DRAIN_REASON,
+    ) -> None:
+        """Fence admission and exit only after Core and the durable spool are empty."""
+
+        timeout, reason_code = _normalize_drain_options(timeout, reason_code)
+        if self._drain_task is None:
+            if not self._started or self._completed:
+                raise RuntimeError("RuntimeWorker must be running before it can drain")
+            # Admission linearizes here, before the first network operation.
+            self._draining = True
+            self._drain_task = asyncio.create_task(
+                self._run_drain(timeout=timeout, reason_code=reason_code)
+            )
+            self._drain_task.add_done_callback(_consume_task_exception)
+        await asyncio.shield(self._drain_task)
+
+    async def _run_drain(self, *, timeout: float, reason_code: str) -> None:
+        operation = asyncio.create_task(
+            self._perform_drain(timeout=timeout, reason_code=reason_code)
+        )
+        try:
+            await asyncio.wait_for(operation, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            status = self._runtime_spool_status()
+            self._request_stop("drain_failure")
+            raise RuntimeDrainTimeoutError(timeout, status) from exc
+        except BaseException:
+            self._request_stop("drain_failure")
+            raise
+
+    async def _perform_drain(self, *, timeout: float, reason_code: str) -> None:
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout)
+        _, inflight = self._capacity_snapshot()
+        request = {
+            "deadline_at": format_datetime(deadline),
+            "reason_code": reason_code,
+            "capacity": 0,
+            "inflight": inflight,
+        }
+        server_drain = await self._request_runtime_drain(request)
+        while True:
+            status = self._runtime_spool_status()
+            if status.empty and not self._active:
+                if server_drain["inflight"] > 0:
+                    server_drain = await self._request_runtime_drain(request)
+                    if server_drain["inflight"] > 0:
+                        await self._wait_for_drain_progress()
+                        continue
+                if self._drain_before_stop is not None:
+                    await _invoke_optional(self._drain_before_stop)
+                if not self._request_stop("drain"):
+                    raise _RuntimeStoppedBeforeDrain
+                await self._done.wait()
+                return
+            await self._wait_for_drain_progress()
+
+    async def _request_runtime_drain(self, request: dict[str, Any]) -> dict[str, Any]:
+        attempt = 0
+        while True:
+            if self._stopping.is_set():
+                raise _RuntimeStoppedBeforeDrain
+            if self._ready is None or self._transport is None or self._store is None:
+                await self._wait_for_drain_progress(min(self._retry_delay(attempt), 0.1))
+                attempt += 1
+                continue
+            transport = self._transport
+            try:
+
+                async def operation() -> dict[str, Any]:
+                    nonlocal transport
+                    async with self._claim_switch_lock:
+                        transport = self._transport_required()
+                        method = getattr(transport, "drain_session", None)
+                        if method is None:
+                            raise RuntimeProtocolError(
+                                "Runtime transport does not implement session drain"
+                            )
+                        value = method(
+                            self._store_required().identity.runtime_session_id,
+                            request,
+                        )
+                        if not inspect.isawaitable(value):
+                            raise RuntimeProtocolError(
+                                "Runtime transport session drain must be asynchronous"
+                            )
+                        return await self._drain_call_or_stop(value)
+
+                response = await self._policy_operation(operation)
+                return validate_runtime_drain_payload(response)
+            except asyncio.CancelledError:
+                raise
+            except _RuntimeStoppedBeforeDrain:
+                raise
+            except Exception as exc:
+                if _fatal_error(exc):
+                    raise
+                if transport.kind == "ws" and transport is self._transport:
+                    try:
+                        await self._recover_transport(transport)
+                    except Exception as recovery_error:
+                        if _fatal_error(recovery_error):
+                            raise
+                await self._wait_for_drain_progress(min(self._retry_delay(attempt), 0.1))
+                attempt += 1
+
+    async def _drain_call_or_stop(self, awaitable: Awaitable[Any]) -> Any:
+        call = asyncio.ensure_future(awaitable)
+        stopping = asyncio.create_task(self._stopping.wait())
+        try:
+            done, _ = await asyncio.wait({call, stopping}, return_when=asyncio.FIRST_COMPLETED)
+            if stopping in done:
+                call.cancel()
+                await asyncio.gather(call, return_exceptions=True)
+                raise _RuntimeStoppedBeforeDrain
+            return await call
+        finally:
+            if not call.done():
+                call.cancel()
+                await asyncio.gather(call, return_exceptions=True)
+            stopping.cancel()
+            await asyncio.gather(stopping, return_exceptions=True)
+
+    async def _wait_for_drain_progress(self, delay: float = 0.025) -> None:
+        if self._stopping.is_set():
+            raise _RuntimeStoppedBeforeDrain
+        try:
+            await asyncio.wait_for(self._stopping.wait(), timeout=max(delay, 0.001))
+        except asyncio.TimeoutError:
+            return
+        raise _RuntimeStoppedBeforeDrain
+
+    def _runtime_spool_status(self) -> RuntimeSpoolStatus:
+        if self._store is None:
+            return RuntimeSpoolStatus(0, 0, 0)
+        provider = getattr(self._store, "spool_status", None)
+        if provider is not None:
+            status = provider()
+            if not isinstance(status, RuntimeSpoolStatus):
+                raise RuntimeStoreError("Runtime store returned an invalid spool status")
+            return status
+        assignments = self._store.assignments()
+        events = 0
+        results = 0
+        for assignment in assignments:
+            attempt_id = assignment.identity.attempt.attempt_id
+            events += len(self._store.pending_events(attempt_id))
+            if self._store.pending_result(attempt_id) is not None:
+                results += 1
+        return RuntimeSpoolStatus(len(assignments), events, results)
+
+    def _request_stop(self, owner: str) -> bool:
+        self._draining = True
+        if self._stopping.is_set():
+            return False
+        self._stop_owner = owner
+        self._stopping.set()
+        return True
 
     async def _start(self) -> None:
         if self._store is None:
@@ -901,21 +1078,7 @@ class RuntimeWorker:
             self._cancellations.add(cancellation_id)
             self._spawn(self._handle_cancel(payload))
         elif command_type == "runtime.drain":
-            _require_response_keys(
-                payload,
-                required={"deadline_at", "reason_code", "capacity", "inflight"},
-            )
-            try:
-                parse_datetime(payload["deadline_at"])
-            except (TypeError, ValueError) as exc:
-                raise RuntimeProtocolError("Runtime drain deadline is invalid") from exc
-            if (
-                not isinstance(payload["reason_code"], str)
-                or not 1 <= len(payload["reason_code"]) <= 120
-            ):
-                raise RuntimeProtocolError("Runtime drain reason is invalid")
-            _nonnegative_protocol_integer(payload["capacity"], "Runtime drain capacity")
-            _nonnegative_protocol_integer(payload["inflight"], "Runtime drain inflight")
+            validate_runtime_drain_payload(payload)
             self._draining = True
             await _invoke_optional(self.on_drain)
         elif command_type == "run.lease.revoked":
@@ -1442,8 +1605,7 @@ class RuntimeWorker:
             self._remove_active_attempt(attempt_id)
 
     async def _shutdown(self) -> None:
-        self._draining = True
-        self._stopping.set()
+        self._request_stop("lifecycle")
         if self._store is not None and self._transport is not None:
             try:
                 await asyncio.wait_for(
@@ -1757,7 +1919,7 @@ class RuntimeWorker:
         if first:
             self._fatal.put_nowait(exc)
         self._force_cancel.set()
-        self._stopping.set()
+        self._request_stop("fatal")
         for active in self._active.values():
             active.cancel_event.set()
             if active.task is not None:
@@ -2250,8 +2412,35 @@ def _bounded(value: str, maximum: int, fallback: str) -> str:
     return value[:maximum]
 
 
+def _normalize_drain_options(timeout: float | None, reason_code: str) -> tuple[float, str]:
+    if timeout is None:
+        timeout = DEFAULT_DRAIN_TIMEOUT
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not 0.001 <= timeout <= MAXIMUM_DRAIN_TIMEOUT
+    ):
+        raise ValueError("RuntimeWorker drain timeout must be between 1ms and 5m")
+    if reason_code == "":
+        reason_code = DEFAULT_DRAIN_REASON
+    if (
+        not isinstance(reason_code, str)
+        or not 1 <= len(reason_code) <= 120
+        or reason_code.strip() != reason_code
+        or any(unicodedata.category(char) == "Cc" for char in reason_code)
+    ):
+        raise ValueError("RuntimeWorker drain reason_code is invalid")
+    return float(timeout), reason_code
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
 __all__ = [
     "DEFAULT_CAPACITY",
+    "DEFAULT_DRAIN_REASON",
     "RuntimeContext",
     "RuntimeHandler",
     "RuntimeHandlerCallable",
