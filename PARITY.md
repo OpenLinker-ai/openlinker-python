@@ -9,7 +9,7 @@ is shared.
 Implemented:
 
 - Agent discovery and Agent Cards
-- synchronous and asynchronous Run creation
+- wait-for-result and start-only Run creation through the async Client
 - Run lookup, events, children, artifacts and messages
 - server-sent Run event streaming and callback helpers
 - creator Agent and Agent Token management

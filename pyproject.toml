@@ -5,16 +5,46 @@ build-backend = "hatchling.build"
 [project]
 name = "openlinker"
 version = "0.2.0"
-description = "Official Python SDK for OpenLinker"
+description = "Official async Python SDK for OpenLinker Core: Agent discovery and management, runs, SSE, webhooks, A2A, and a durable mTLS Runtime Worker."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "OpenLinker" }]
+keywords = [
+  "openlinker",
+  "ai-agents",
+  "agent-registry",
+  "agent-runtime",
+  "runtime-worker",
+  "a2a",
+  "asyncio",
+  "sse",
+  "webhooks",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: AsyncIO",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
 dependencies = [
   "cryptography>=42",
   "httpx>=0.27",
   "websockets>=12",
 ]
+
+[project.urls]
+Homepage = "https://openlinker.ai"
+Documentation = "https://github.com/OpenLinker-ai/openlinker-python#readme"
+Repository = "https://github.com/OpenLinker-ai/openlinker-python"
+Issues = "https://github.com/OpenLinker-ai/openlinker-python/issues"
+Changelog = "https://github.com/OpenLinker-ai/openlinker-python/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 grpc = [

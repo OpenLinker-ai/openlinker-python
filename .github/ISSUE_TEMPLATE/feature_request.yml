@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a change within the Python SDK's open-source scope.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What Python user or contributor problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the API, Runtime, A2A, typing, packaging, or documentation change.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - Platform client
+        - Runtime Worker
+        - A2A or webhooks
+        - Typing or packaging
+        - Documentation
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Compatibility or security impact
+      description: Note any pre-1.0 API, credential, contract, or migration implications.

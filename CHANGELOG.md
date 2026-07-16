@@ -18,3 +18,6 @@ This is a pre-1.0 breaking Runtime cutover.
   protocol generation.
 - Documented Agent Node as an optional migration adapter rather than the default
   Runtime path.
+- Added complete bilingual repository, contribution, security, support, release,
+  package metadata, typing marker, and MIT license files for the first public
+  Python SDK release.
