@@ -32,8 +32,10 @@ from .transport import (
     ClaimedAssignment,
     HTTPRuntimeTransport,
     RuntimeTransport,
+    RuntimeTransportPolicy,
     WebSocketRuntimeTransport,
-    discover_runtime_origin,
+    discover_runtime_connection,
+    resolve_runtime_transport_selection,
     validate_platform_origin,
     validate_runtime_origin,
 )
@@ -198,6 +200,8 @@ class RuntimeWorker:
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         retry_minimum: float = DEFAULT_RETRY_MINIMUM,
         retry_maximum: float = DEFAULT_RETRY_MAXIMUM,
+        websocket_probe_interval: float | None = None,
+        websocket_probe_timeout: float = 10.0,
         shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
         on_ready: Callable[[RuntimeReady], Any] | None = None,
         on_fatal: Callable[[BaseException], Any] | None = None,
@@ -222,6 +226,8 @@ class RuntimeWorker:
         self.heartbeat_interval = heartbeat_interval
         self.retry_minimum = retry_minimum
         self.retry_maximum = retry_maximum
+        self.websocket_probe_interval = websocket_probe_interval
+        self.websocket_probe_timeout = websocket_probe_timeout
         self.shutdown_timeout = shutdown_timeout
         self.on_ready = on_ready
         self.on_fatal = on_fatal
@@ -248,6 +254,8 @@ class RuntimeWorker:
         self._background: set[asyncio.Task[Any]] = set()
         self._claim_switch_lock = asyncio.Lock()
         self._transport_transitioning = False
+        self._transport_order: tuple[str, ...] = ("ws", "pull")
+        self._session_stale_after = 0.0
         self._test_transport_recovery: Callable[[], Awaitable[RuntimeTransport]] | None = None
 
     async def run(self) -> None:
@@ -312,7 +320,7 @@ class RuntimeWorker:
             self._spool_loop,
         ):
             self._spawn(operation())
-        if self.transport_mode == "auto" and self._transport_required().kind == "pull":
+        if self._auto_allows_pull_fallback() and self._transport_required().kind == "pull":
             self._spawn(self._websocket_probe_loop())
 
     async def _setup_transport(self) -> None:
@@ -320,7 +328,9 @@ class RuntimeWorker:
             return
         origin = self.runtime_url
         if not origin:
-            origin = await discover_runtime_origin(self.platform_url)
+            connection = await discover_runtime_connection(self.platform_url)
+            origin = connection.runtime_origin
+            self._apply_transport_policy(connection.policy)
         self.runtime_url = validate_runtime_origin(origin)
         self._http_transport = HTTPRuntimeTransport(self.runtime_url, self.agent_token, self.mtls)
         if self.transport_mode == "pull":
@@ -328,6 +338,9 @@ class RuntimeWorker:
             return
         if self.transport_mode == "ws":
             self._transport = await self._connect_websocket_with_retry(retry_all=True)
+            return
+        if not self._auto_prefers_websocket():
+            self._transport = self._http_transport
             return
         try:
             websocket = WebSocketRuntimeTransport(
@@ -348,6 +361,9 @@ class RuntimeWorker:
                 except Exception as retry_error:
                     if _fatal_error(retry_error):
                         raise
+            if not self._auto_allows_pull_fallback():
+                self._transport = await self._connect_websocket_with_retry(retry_all=True)
+                return
             self._transport = self._http_transport
 
     async def _connect_websocket_with_retry(
@@ -1171,7 +1187,7 @@ class RuntimeWorker:
             try:
                 if self._test_transport_recovery is not None:
                     replacement = await self._test_transport_recovery()
-                elif self.transport_mode == "auto":
+                elif self._auto_allows_pull_fallback():
                     if self._http_transport is None:
                         raise ConnectionError("HTTP Runtime transport is unavailable")
                     replacement = self._http_transport
@@ -1201,7 +1217,7 @@ class RuntimeWorker:
                 self._transport_transitioning = False
             if previous is not replacement and previous is not self._http_transport:
                 await previous.close()
-            if self.transport_mode == "auto" and replacement.kind == "pull":
+            if self._auto_allows_pull_fallback() and replacement.kind == "pull":
                 self._spawn(self._websocket_probe_loop())
 
     async def _websocket_probe_loop(self) -> None:
@@ -1209,7 +1225,12 @@ class RuntimeWorker:
         while not self._stopping.is_set():
             if self._transport_required().kind != "pull":
                 return
-            await self._wait_or_stop(self._retry_delay(attempt))
+            delay = (
+                self.websocket_probe_interval
+                if self.websocket_probe_interval is not None
+                else self._retry_delay(attempt)
+            )
+            await self._wait_or_stop(delay)
             if self._stopping.is_set():
                 return
             try:
@@ -1220,19 +1241,10 @@ class RuntimeWorker:
                     previous = self._transport
                     replacement: RuntimeTransport | None = None
                     try:
-                        if self._test_transport_recovery is not None:
-                            replacement = await self._test_transport_recovery()
-                        else:
-                            if self._http_transport is None:
-                                return
-                            websocket = WebSocketRuntimeTransport(
-                                self.runtime_url,
-                                self.agent_token,
-                                self.mtls,
-                                self._http_transport,
-                            )
-                            await websocket.connect(self._hello())
-                            replacement = websocket
+                        replacement = await asyncio.wait_for(
+                            self._probe_websocket_transport(),
+                            timeout=self.websocket_probe_timeout,
+                        )
                         replacement_ready = await self._attach_session(replacement)
                         await self._resume_durable_state(reconnect=True, transport=replacement)
                         self._transport = replacement
@@ -1528,6 +1540,59 @@ class RuntimeWorker:
         delay = min(self.retry_maximum, self.retry_minimum * (2 ** min(attempt, 16)))
         return random.uniform(delay * 0.8, delay * 1.2)
 
+    async def _probe_websocket_transport(self) -> RuntimeTransport:
+        if self._test_transport_recovery is not None:
+            return await self._test_transport_recovery()
+        if self._http_transport is None:
+            raise ConnectionError("HTTP Runtime transport is unavailable")
+        websocket = WebSocketRuntimeTransport(
+            self.runtime_url,
+            self.agent_token,
+            self.mtls,
+            self._http_transport,
+        )
+        try:
+            await websocket.connect(self._hello())
+            return websocket
+        except BaseException:
+            await websocket.close()
+            raise
+
+    def _apply_transport_policy(self, policy: RuntimeTransportPolicy) -> None:
+        mode, order = resolve_runtime_transport_selection(self.transport_mode, policy)
+        self.transport_mode = mode
+        self._transport_order = order
+        if policy.heartbeat_interval is not None:
+            self.heartbeat_interval = policy.heartbeat_interval
+        if policy.retry_minimum is not None:
+            self.retry_minimum = policy.retry_minimum
+        if policy.retry_maximum is not None:
+            self.retry_maximum = policy.retry_maximum
+        if policy.websocket_probe_interval is not None:
+            self.websocket_probe_interval = policy.websocket_probe_interval
+        if policy.websocket_probe_timeout is not None:
+            self.websocket_probe_timeout = policy.websocket_probe_timeout
+        if policy.session_stale_after is not None:
+            self._session_stale_after = policy.session_stale_after
+        self._validate_config()
+        if (
+            self._session_stale_after > 0
+            and self.heartbeat_interval >= self._session_stale_after
+        ):
+            raise RuntimeProtocolError(
+                "OpenLinker Runtime heartbeat interval must be below the Session stale interval"
+            )
+
+    def _auto_prefers_websocket(self) -> bool:
+        return (
+            self.transport_mode == "auto"
+            and bool(self._transport_order)
+            and self._transport_order[0] == "ws"
+        )
+
+    def _auto_allows_pull_fallback(self) -> bool:
+        return self._auto_prefers_websocket() and "pull" in self._transport_order[1:]
+
     def _validate_config(self) -> None:
         _canonical_uuid(self.node_id, "node_id")
         _canonical_uuid(self.agent_id, "agent_id")
@@ -1556,6 +1621,7 @@ class RuntimeWorker:
                 self.heartbeat_interval,
                 self.retry_minimum,
                 self.retry_maximum,
+                self.websocket_probe_timeout,
                 self.shutdown_timeout,
             )
             <= 0
@@ -1563,6 +1629,8 @@ class RuntimeWorker:
             raise ValueError("Runtime timing values must be positive")
         if self.retry_maximum < self.retry_minimum:
             raise ValueError("retry_maximum must not be less than retry_minimum")
+        if self.websocket_probe_interval is not None and self.websocket_probe_interval <= 0:
+            raise ValueError("websocket_probe_interval must be positive")
         if self.claim_wait > 30 or self.command_wait > 30:
             raise ValueError("Runtime claim_wait and command_wait must not exceed 30 seconds")
         if len(self.node_version) > 100:

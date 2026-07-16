@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from openlinker import runtime
-from openlinker.runtime.transport import ClaimedAssignment
+from openlinker.runtime.transport import ClaimedAssignment, RuntimeTransportPolicy
 
 
 NODE_ID = "11111111-1111-4111-8111-111111111111"
@@ -854,6 +854,45 @@ async def test_handler_return_closes_background_runtime_context_calls():
         transport.result_upload_available = True
         await worker.stop()
         await running
+
+
+def test_worker_applies_discovered_transport_selection_and_timings():
+    worker = make_worker(
+        runtime.MemoryRuntimeStore(),
+        FakeTransport(),
+        lambda context: {},
+        mode="auto",
+    )
+    worker._apply_transport_policy(
+        RuntimeTransportPolicy(
+            allowed_transports=("pull", "ws"),
+            default_transport="auto",
+            heartbeat_interval=20.0,
+            session_stale_after=45.0,
+            retry_minimum=0.25,
+            retry_maximum=15.0,
+            websocket_probe_interval=15.0,
+            websocket_probe_timeout=10.0,
+        )
+    )
+    assert worker.transport_mode == "auto"
+    assert worker._transport_order == ("pull", "ws")
+    assert not worker._auto_prefers_websocket()
+    assert worker.heartbeat_interval == 20.0
+    assert worker.retry_minimum == 0.25
+    assert worker.retry_maximum == 15.0
+    assert worker.websocket_probe_interval == 15.0
+    assert worker.websocket_probe_timeout == 10.0
+
+    worker._apply_transport_policy(
+        RuntimeTransportPolicy(
+            allowed_transports=("ws", "pull"),
+            default_transport="pull",
+        )
+    )
+    assert worker.transport_mode == "pull"
+    assert worker._transport_order == ("pull",)
+    assert not worker._auto_allows_pull_fallback()
 
 
 @pytest.mark.asyncio

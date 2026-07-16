@@ -73,6 +73,24 @@ class ClaimedAssignment:
     delivery_id: str = ""
 
 
+@dataclass(frozen=True)
+class RuntimeTransportPolicy:
+    allowed_transports: tuple[str, ...] = ("ws", "pull")
+    default_transport: str = "auto"
+    heartbeat_interval: float | None = None
+    session_stale_after: float | None = None
+    retry_minimum: float | None = None
+    retry_maximum: float | None = None
+    websocket_probe_interval: float | None = None
+    websocket_probe_timeout: float | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeDiscoveryConnection:
+    runtime_origin: str
+    policy: RuntimeTransportPolicy
+
+
 class RuntimeTransport(Protocol):
     kind: str
 
@@ -120,11 +138,11 @@ class RuntimeTransport(Protocol):
     async def close(self) -> None: ...
 
 
-async def discover_runtime_origin(
+async def discover_runtime_connection(
     platform_url: str,
     *,
     _client: httpx.AsyncClient | None = None,
-) -> str:
+) -> RuntimeDiscoveryConnection:
     """Discover the mTLS Runtime origin without sending Runtime credentials."""
 
     origin = validate_platform_origin(platform_url)
@@ -146,6 +164,19 @@ async def discover_runtime_origin(
     finally:
         if owns_client:
             await client.aclose()
+    return decode_runtime_discovery_manifest(manifest)
+
+
+async def discover_runtime_origin(
+    platform_url: str,
+    *,
+    _client: httpx.AsyncClient | None = None,
+) -> str:
+    connection = await discover_runtime_connection(platform_url, _client=_client)
+    return connection.runtime_origin
+
+
+def decode_runtime_discovery_manifest(manifest: dict[str, Any]) -> RuntimeDiscoveryConnection:
     base_urls = manifest.get("base_urls")
     runtime = manifest.get("runtime")
     if not isinstance(base_urls, dict) or not isinstance(runtime, dict):
@@ -155,7 +186,121 @@ async def discover_runtime_origin(
     discovered = base_urls.get("runtime")
     if not isinstance(discovered, str) or not discovered:
         raise RuntimeProtocolError("OpenLinker does not provide a Runtime origin")
-    return validate_runtime_origin(discovered)
+    return RuntimeDiscoveryConnection(
+        runtime_origin=validate_runtime_origin(discovered),
+        policy=decode_runtime_transport_policy(runtime),
+    )
+
+
+def resolve_runtime_transport_selection(
+    configured: str, policy: RuntimeTransportPolicy
+) -> tuple[str, tuple[str, ...]]:
+    configured = configured.strip().lower()
+    if configured != "auto" and configured not in policy.allowed_transports:
+        raise ValueError(
+            f"configured Runtime transport {configured!r} is not allowed by OpenLinker"
+        )
+    mode = policy.default_transport if configured == "auto" else configured
+    if mode != "auto":
+        if mode not in policy.allowed_transports:
+            raise RuntimeProtocolError(
+                f"OpenLinker Runtime default transport {mode!r} is not allowed"
+            )
+        return mode, (mode,)
+    return mode, policy.allowed_transports
+
+
+def decode_runtime_transport_policy(runtime: dict[str, Any]) -> RuntimeTransportPolicy:
+    raw_transports = runtime.get("transports", ["websocket", "long_poll"])
+    if not isinstance(raw_transports, list):
+        raise RuntimeProtocolError("OpenLinker Runtime transport allowlist is invalid")
+    allowed: list[str] = []
+    for raw in raw_transports:
+        if not isinstance(raw, str):
+            raise RuntimeProtocolError("OpenLinker Runtime transport allowlist is invalid")
+        mode = _manifest_transport_mode(raw)
+        if mode is not None and mode not in allowed:
+            allowed.append(mode)
+    if not allowed:
+        raise RuntimeProtocolError(
+            "OpenLinker Runtime does not allow a transport supported by this SDK"
+        )
+
+    raw_default = runtime.get("default_transport", "auto")
+    if not isinstance(raw_default, str):
+        raise RuntimeProtocolError("OpenLinker Runtime default transport is invalid")
+    default_transport = (
+        "auto" if raw_default.strip().lower() == "auto" else _manifest_transport_mode(raw_default)
+    )
+    if default_transport is None:
+        raise RuntimeProtocolError(
+            f"OpenLinker Runtime default transport {raw_default.strip()!r} is unsupported"
+        )
+    if default_transport != "auto" and default_transport not in allowed:
+        raise RuntimeProtocolError(
+            f"OpenLinker Runtime default transport {default_transport!r} is outside its allowlist"
+        )
+
+    if "transport_policy" not in runtime:
+        return RuntimeTransportPolicy(tuple(allowed), default_transport)
+    raw_policy = runtime["transport_policy"]
+    if not isinstance(raw_policy, dict):
+        raise RuntimeProtocolError("OpenLinker Runtime transport policy is invalid")
+    if "version" in raw_policy and (
+        isinstance(raw_policy["version"], bool) or raw_policy["version"] != 1
+    ):
+        raise RuntimeProtocolError(
+            f"OpenLinker Runtime transport policy version {raw_policy['version']!r} is unsupported"
+        )
+    heartbeat = _optional_policy_duration(raw_policy, "heartbeat_interval_seconds", 1.0)
+    stale_after = _optional_policy_duration(raw_policy, "session_stale_after_seconds", 1.0)
+    retry_minimum = _optional_policy_duration(raw_policy, "retry_minimum_ms", 0.001)
+    retry_maximum = _optional_policy_duration(raw_policy, "retry_maximum_ms", 0.001)
+    probe_interval = _optional_policy_duration(
+        raw_policy, "websocket_probe_interval_ms", 0.001
+    )
+    probe_timeout = _optional_policy_duration(raw_policy, "websocket_probe_timeout_ms", 0.001)
+    if (retry_maximum if retry_maximum is not None else 15.0) < (
+        retry_minimum if retry_minimum is not None else 0.25
+    ):
+        raise RuntimeProtocolError("OpenLinker Runtime retry maximum is below retry minimum")
+    if stale_after is not None and (heartbeat if heartbeat is not None else 5.0) >= stale_after:
+        raise RuntimeProtocolError(
+            "OpenLinker Runtime heartbeat interval must be below the Session stale interval"
+        )
+    return RuntimeTransportPolicy(
+        allowed_transports=tuple(allowed),
+        default_transport=default_transport,
+        heartbeat_interval=heartbeat,
+        session_stale_after=stale_after,
+        retry_minimum=retry_minimum,
+        retry_maximum=retry_maximum,
+        websocket_probe_interval=probe_interval,
+        websocket_probe_timeout=probe_timeout,
+    )
+
+
+def _manifest_transport_mode(value: str) -> str | None:
+    normalized = value.strip().lower()
+    if normalized in {"websocket", "ws"}:
+        return "ws"
+    if normalized in {"long_poll", "pull"}:
+        return "pull"
+    return None
+
+
+def _optional_policy_duration(
+    policy: dict[str, Any], field: str, multiplier: float
+) -> float | None:
+    if field not in policy:
+        return None
+    value = policy[field]
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 86_400_000:
+        raise RuntimeProtocolError(f"OpenLinker Runtime {field} is outside the supported range")
+    duration = value * multiplier
+    if duration > 86_400:
+        raise RuntimeProtocolError(f"OpenLinker Runtime {field} is outside the supported range")
+    return duration
 
 
 def validate_platform_origin(value: str) -> str:
@@ -970,6 +1115,12 @@ __all__ = [
     "ClaimedAssignment",
     "HTTPRuntimeTransport",
     "RuntimeTransport",
+    "RuntimeDiscoveryConnection",
+    "RuntimeTransportPolicy",
     "WebSocketRuntimeTransport",
+    "decode_runtime_discovery_manifest",
+    "decode_runtime_transport_policy",
+    "discover_runtime_connection",
     "discover_runtime_origin",
+    "resolve_runtime_transport_selection",
 ]

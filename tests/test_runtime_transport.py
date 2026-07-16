@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -11,7 +12,9 @@ from openlinker import runtime
 from openlinker.runtime.transport import (
     HTTPRuntimeTransport,
     WebSocketRuntimeTransport,
+    decode_runtime_discovery_manifest,
     discover_runtime_origin,
+    resolve_runtime_transport_selection,
     validate_platform_origin,
     validate_runtime_origin,
 )
@@ -19,6 +22,44 @@ from openlinker.runtime.transport import (
 
 ATTACHMENT_ID = "88888888-8888-4888-8888-888888888888"
 NEXT_ATTACHMENT_ID = "99999999-9999-4999-8999-999999999999"
+
+
+def test_runtime_discovery_policy_fixtures_are_language_consistent():
+    fixture = json.loads(
+        (Path(__file__).parents[1] / "contracts/runtime-discovery-policy-fixtures.json").read_text()
+    )
+    connections = {}
+    for item in fixture["cases"]:
+        connection = decode_runtime_discovery_manifest(item["manifest"])
+        connections[item["name"]] = connection
+        policy = connection.policy
+        assert {
+            "allowed": list(policy.allowed_transports),
+            "default": policy.default_transport,
+            "heartbeat_interval_ms": round((policy.heartbeat_interval or 5.0) * 1000),
+            "session_stale_after_ms": round((policy.session_stale_after or 0.0) * 1000),
+            "retry_minimum_ms": round((policy.retry_minimum or 0.25) * 1000),
+            "retry_maximum_ms": round((policy.retry_maximum or 15.0) * 1000),
+            "websocket_probe_interval_ms": round(
+                (policy.websocket_probe_interval or 15.0) * 1000
+            ),
+            "websocket_probe_timeout_ms": round(
+                (policy.websocket_probe_timeout or 10.0) * 1000
+            ),
+        } == item["expected"]
+
+    for item in fixture["configured_transport_cases"]:
+        connection = (
+            decode_runtime_discovery_manifest(item["manifest"])
+            if "manifest" in item
+            else connections[item["manifest_case"]]
+        )
+        if "error" in item:
+            with pytest.raises((ValueError, runtime.RuntimeProtocolError), match=item["error"]):
+                resolve_runtime_transport_selection(item["configured"], connection.policy)
+            continue
+        mode, _ = resolve_runtime_transport_selection(item["configured"], connection.policy)
+        assert mode == item["effective"]
 
 
 def ready_payload(attachment_id: str = ATTACHMENT_ID) -> dict[str, object]:
