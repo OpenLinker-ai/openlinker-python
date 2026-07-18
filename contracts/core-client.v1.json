@@ -1,0 +1,33 @@
+{
+  "name": "openlinker-core-client",
+  "version": "v1",
+  "package": "openlinker",
+  "scope": "core",
+  "rules": {
+    "single_package_first": true,
+    "forbidden_path_prefixes": [
+      "/api/v1/cloud",
+      "/api/v1/tasks",
+      "/api/v1/task-templates",
+      "/api/v1/workflows",
+      "/api/v1/workflow-runs",
+      "/api/v1/billing",
+      "/api/v1/wallet",
+      "/api/v1/stripe"
+    ]
+  },
+  "endpoints": [
+    {"client_method":"list_agents","http_method":"GET","path":"/api/v1/agents","auth":"none"},
+    {"client_method":"get_agent","http_method":"GET","path":"/api/v1/agents/{slug}","auth":"none"},
+    {"client_method":"get_agent_card","http_method":"GET","path":"/api/v1/agents/{slug}/agent-card.json","auth":"none"},
+    {"client_method":"get_agent_card","http_method":"GET","path":"/api/v1/agents/{slug}/agent-card.extended.json","auth":"none"},
+    {"client_method":"run_agent","http_method":"POST","path":"/api/v1/run","auth":"access_token","required_scope":"agents:run","required_headers":["Idempotency-Key"],"success_statuses":[200,201,202],"response_headers":["Location","Idempotency-Replayed"],"response_fields":["agent_connection_mode","runtime_transport","runtime_transport_reason","runtime_transport_changed_at","dispatch_state","attempt_count","max_attempts","started_at","replayed"]},
+    {"client_method":"start_agent_run","http_method":"POST","path":"/api/v1/runs","auth":"access_token","required_scope":"agents:run","required_headers":["Idempotency-Key"],"success_statuses":[200,201,202],"response_headers":["Location","Idempotency-Replayed"],"response_fields":["agent_connection_mode","runtime_transport","runtime_transport_reason","runtime_transport_changed_at","dispatch_state","attempt_count","max_attempts","started_at","replayed"]},
+    {"client_method":"get_run","http_method":"GET","path":"/api/v1/runs/{id}","auth":"access_token","required_scope":"runs:read","response_fields":["agent_connection_mode","runtime_transport","runtime_transport_reason","runtime_transport_changed_at","dispatch_state","attempt_count","max_attempts","started_at","replayed"]},
+    {"client_method":"list_run_events","http_method":"GET","path":"/api/v1/runs/{id}/events","auth":"access_token","required_scope":"runs:read","response_fields":["items","meta.requested_after_sequence","meta.effective_after_sequence","meta.retained_through_sequence","meta.earliest_available_sequence","meta.latest_available_sequence","meta.retention_gap","meta.terminal","meta.stream_complete"]},
+    {"client_method":"list_run_children","http_method":"GET","path":"/api/v1/runs/{id}/children","auth":"access_token","required_scope":"runs:read","response_fields":["parent_run_id","items[].child_run_id","items[].caller_agent_id","items[].target_agent_id","items[].status","items[].children"]},
+    {"client_method":"list_run_artifacts","http_method":"GET","path":"/api/v1/runs/{id}/artifacts","auth":"access_token","required_scope":"runs:read"},
+    {"client_method":"list_run_messages","http_method":"GET","path":"/api/v1/runs/{id}/messages","auth":"access_token","required_scope":"runs:read"},
+    {"client_method":"stream_run_events","http_method":"GET","path":"/api/v1/runs/{id}/stream","auth":"access_token","required_scope":"runs:read"}
+  ]
+}

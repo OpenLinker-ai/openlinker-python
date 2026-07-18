@@ -163,6 +163,7 @@ class TaskCallbackConfig(Model):
 class RunAgentRequest(Model):
     agent_id: str = ""
     input: Any = None
+    idempotency_key: str | None = None
     metadata: Any = None
     a2a_context: RunA2AContext | None = None
     task_callback: TaskCallbackConfig | None = None
@@ -246,18 +247,70 @@ class RunEventResponse(Model):
 
 
 @dataclass
+class RunEventPageMeta(Model):
+    requested_after_sequence: int = 0
+    effective_after_sequence: int = 0
+    retained_through_sequence: int = 0
+    earliest_available_sequence: int | None = None
+    latest_available_sequence: int | None = None
+    retention_gap: bool = False
+    terminal: bool = False
+    stream_complete: bool = False
+
+
+@dataclass
 class ListRunEventsResponse(Model):
+    items: list[RunEventResponse] = jfield(default_factory=list)
+    meta: RunEventPageMeta = jfield(default_factory=RunEventPageMeta)
+    # Deprecated compatibility view. Core returns `items`; keep `events` for
+    # callers of older Python SDK versions.
     events: list[RunEventResponse] = jfield(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None):
+        result = super().from_dict(data)
+        if result.items and not result.events:
+            result.events = result.items
+        elif result.events and not result.items:
+            result.items = result.events
+        return result
+
+
+@dataclass
+class RunSkillRef(Model):
+    id: str = ""
+    name: str = ""
 
 
 @dataclass
 class RunChildResponse(Model):
     child_run_id: str = ""
+    parent_run_id: str = ""
+    caller_agent_id: str = ""
+    caller_agent_slug: str = ""
+    caller_agent_name: str = ""
+    caller_agent_tags: list[str] = jfield(default_factory=list)
+    caller_skills: list[RunSkillRef] = jfield(default_factory=list)
+    target_agent_id: str = ""
+    target_agent_slug: str = ""
+    target_agent_name: str = ""
+    target_agent_tags: list[str] = jfield(default_factory=list)
+    target_skills: list[RunSkillRef] = jfield(default_factory=list)
+    reason: str = ""
     status: str = ""
+    cost_cents: int = 0
+    duration_ms: int | None = None
+    started_at: str = ""
+    finished_at: str | None = None
+    source: str = ""
+    billing_mode: str = ""
+    a2a_context: Any = None
+    children: list[RunChildResponse] = jfield(default_factory=list)
 
 
 @dataclass
 class ListRunChildrenResponse(Model):
+    parent_run_id: str = ""
     items: list[RunChildResponse] = jfield(default_factory=list)
 
 
@@ -439,3 +492,25 @@ class AgentTokenListResponse(Model):
     sort_by: str = ""
     sort_dir: str = ""
     has_more: bool = False
+
+
+@dataclass
+class RegisterAgentViaTokenRequest(Model):
+    slug: str | None = None
+    name: str = ""
+    description: str | None = None
+    endpoint_url: str | None = None
+    endpoint_auth_header: str | None = None
+    price_per_call_cents: int = 0
+    tags: list[str] = jfield(default_factory=list)
+    ability_tags: list[str] = jfield(default_factory=list)
+    skill_ids: list[str] = jfield(default_factory=list)
+    visibility: str | None = None
+    connection_mode: str | None = None
+    mcp_tool_name: str | None = None
+
+
+@dataclass
+class RegisterAgentViaTokenResponse(Model):
+    agent: AgentResponse = jfield(default_factory=AgentResponse)
+    agent_token: AgentTokenResponse = jfield(default_factory=AgentTokenResponse)

@@ -12,6 +12,7 @@ from websockets.frames import Close
 
 from openlinker import runtime
 import openlinker.runtime.worker as runtime_worker_module
+from openlinker.runtime.store import AssignmentRecord
 from openlinker.runtime.transport import (
     ClaimedAssignment,
     RuntimeDiscoveryConnection,
@@ -85,6 +86,8 @@ class FakeTransport:
         self.create_calls = 0
         self.session_conflicts = 0
         self.ack_failures = 0
+        self.ack_error: Exception | None = None
+        self.reject_error: Exception | None = None
         self.event_failures = 0
         self.result_failures = 0
         self.event_upload_available = True
@@ -169,6 +172,8 @@ class FakeTransport:
         self.ack_attempts.append(request)
         self.ack_entered.set()
         await self.ack_release.wait()
+        if self.ack_error is not None:
+            raise self.ack_error
         if len(self.ack_attempts) <= self.ack_failures:
             raise ConnectionError("assignment ACK response was lost")
         return {
@@ -181,6 +186,8 @@ class FakeTransport:
         self, request: dict[str, Any], *, delivery_id: str = ""
     ) -> dict[str, Any]:
         del delivery_id
+        if self.reject_error is not None:
+            raise self.reject_error
         return {
             "attempt_identity": request["attempt_identity"],
             "outcome": "offer_rejected",
@@ -398,6 +405,94 @@ async def test_lost_acks_replay_the_same_assignment_event_and_result_ids():
     )
     assert len(transport.result_attempts) == 2
     assert transport.result_attempts[0]["result_id"] == transport.result_attempts[1]["result_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code",
+    ["RUN_CANCEL_REQUESTED", "STALE_LEASE", "LEASE_EXPIRED", "RUN_ALREADY_TERMINAL"],
+)
+async def test_assignment_confirmation_terminal_errors_converge_one_attempt(code):
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    offered = assignment(store)
+    transport.ack_error = runtime.RuntimeRemoteError(code, "terminal", status_code=409)
+    handler_calls = 0
+
+    async def handler(context: runtime.RuntimeContext) -> dict[str, Any]:
+        nonlocal handler_calls
+        del context
+        handler_calls += 1
+        return {}
+
+    worker = make_worker(store, transport, handler)
+    await worker._handle_assignment(ClaimedAssignment(offered, "delivery-terminal"))
+
+    assert handler_calls == 0
+    assert store.assignments() == []
+    assert offered.attempt_identity.attempt_id in worker._terminal_attempts
+    assert worker._fatal.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["started", "finished"])
+async def test_duplicate_owned_assignment_terminal_reack_is_benign(state):
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    offered = assignment(store)
+    worker = make_worker(store, transport, lambda _context: {})
+    local = worker._local_identity(offered.attempt_identity)
+    record = store.create_assignment(
+        AssignmentRecord(
+            identity=local,
+            input=offered.input,
+            metadata=offered.metadata,
+            node_envelope=offered.node_envelope,
+            agent_invocation_token=offered.agent_invocation_token,
+            offer_expires_at=offered.offer_expires_at,
+            attempt_deadline_at=offered.attempt_deadline_at,
+            run_deadline_at=offered.run_deadline_at,
+        )
+    )
+    for next_state in ("ack_sent", "confirmed", "started"):
+        record = store.advance_assignment(record.identity.assignment_message_id, next_state)
+    if state == "finished":
+        store.store_result(
+            offered.attempt_identity.attempt_id,
+            {
+                "attempt_identity": offered.attempt_identity.to_dict(),
+                "result_id": CANCELLATION_ID,
+                "duration_ms": 1,
+                "final_client_event_seq": 0,
+                "status": "success",
+                "output": {},
+            },
+        )
+    transport.ack_error = runtime.RuntimeRemoteError(
+        "RUN_ALREADY_TERMINAL", "terminal", status_code=409
+    )
+
+    await worker._handle_assignment(ClaimedAssignment(offered, "delivery-duplicate"))
+
+    assert store.assignments() == []
+    assert offered.attempt_identity.attempt_id in worker._terminal_attempts
+
+
+@pytest.mark.asyncio
+async def test_assignment_rejection_terminal_error_is_benign():
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    offered = assignment(store)
+    transport.reject_error = runtime.RuntimeRemoteError(
+        "RUN_CANCEL_REQUESTED", "canceled before rejection", status_code=409
+    )
+    worker = make_worker(store, transport, lambda _context: {})
+    worker._draining = True
+
+    await worker._handle_assignment(ClaimedAssignment(offered, "delivery-reject"))
+
+    assert store.assignments() == []
+    assert offered.attempt_identity.attempt_id in worker._terminal_attempts
 
 
 @pytest.mark.asyncio
@@ -797,7 +892,76 @@ async def test_cancel_is_scoped_to_the_attempt_and_acknowledged():
                 break
             await asyncio.sleep(0.005)
         assert transport.cancel_states == ["stopping", "stopped"]
+        for _ in range(100):
+            if not worker._cancellations:
+                break
+            await asyncio.sleep(0.005)
+        assert worker._cancellations == set()
     finally:
+        await worker.stop()
+        await running
+
+
+@pytest.mark.asyncio
+async def test_cancel_deadline_failure_does_not_leak_dedupe_or_stop_worker():
+    class SlowStoppingAckTransport(FakeTransport):
+        async def ack_cancel(self, request: dict[str, Any]) -> dict[str, Any]:
+            self.cancel_states.append(request["cancel_state"])
+            if request["cancel_state"] == "stopping":
+                await asyncio.Event().wait()
+            return {
+                "cancellation_id": request["cancellation_id"],
+                "cancel_state": request["cancel_state"],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    store = runtime.MemoryRuntimeStore()
+    transport = SlowStoppingAckTransport()
+    offered = assignment(store)
+    transport.assignment = offered
+    handler_started = asyncio.Event()
+    ignored_cancel = asyncio.Event()
+    release_handler = asyncio.Event()
+
+    async def handler(context: runtime.RuntimeContext) -> dict[str, Any]:
+        del context
+        handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            ignored_cancel.set()
+            await release_handler.wait()
+        return {"late": True}
+
+    worker = make_worker(store, transport, handler)
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(handler_started.wait(), timeout=1)
+        await transport.commands.put(
+            {
+                "type": "run.cancel",
+                "payload": {
+                    "cancellation_id": CANCELLATION_ID,
+                    "attempt_identity": offered.attempt_identity.to_dict(),
+                    "deadline_at": (
+                        datetime.now(timezone.utc) + timedelta(seconds=0.05)
+                    ).isoformat(),
+                    "reason_code": "caller_requested",
+                },
+            }
+        )
+        await asyncio.wait_for(ignored_cancel.wait(), timeout=1)
+        for _ in range(200):
+            if transport.cancel_states == ["stopping", "failed"]:
+                break
+            await asyncio.sleep(0.005)
+
+        assert transport.cancel_states == ["stopping", "failed"]
+        assert worker._cancellations == set()
+        assert not running.done()
+        assert store.assignments()
+    finally:
+        release_handler.set()
         await worker.stop()
         await running
 
