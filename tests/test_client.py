@@ -51,7 +51,31 @@ async def test_run_agent_encodes_request_body():
     async def handler(request: httpx.Request) -> httpx.Response:
         seen["path"] = request.url.path
         seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"run_id": "run-1", "status": "success", "duration_ms": 12})
+        return httpx.Response(
+            200,
+            json={
+                "run_id": "run-1",
+                "agent_id": "agent-1",
+                "agent_slug": "runtime-agent",
+                "agent_name": "Runtime Agent",
+                "agent_connection_mode": "runtime",
+                "status": "success",
+                "cost_cents": 0,
+                "duration_ms": 12,
+                "started_at": "2026-07-18T00:00:00Z",
+                "finished_at": "2026-07-18T00:00:01Z",
+                "source": "api",
+                "runtime_contract_id": "openlinker.runtime.v2",
+                "runtime_transport": "long_poll",
+                "runtime_transport_reason": "websocket_unavailable",
+                "runtime_transport_changed_at": "2026-07-18T00:00:00Z",
+                "dispatch_state": "terminal",
+                "attempt_count": 1,
+                "max_attempts": 3,
+                "latest_attempt_id": "attempt-1",
+                "replayed": False,
+            },
+        )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as hc:
         sdk = openlinker_client.Client("https://api.example.test", http_client=hc)
@@ -69,8 +93,15 @@ async def test_run_agent_encodes_request_body():
         )
 
     assert resp.run_id == "run-1"
+    assert resp.agent_connection_mode == "runtime"
+    assert resp.runtime_transport == "long_poll"
+    assert resp.runtime_transport_reason == "websocket_unavailable"
+    assert resp.dispatch_state == "terminal"
+    assert resp.attempt_count == 1
     assert seen["path"] == "/api/v1/run"
     assert seen["body"]["agent_id"] == "agent-1"
+    assert "agent_connection_mode" not in seen["body"]
+    assert "runtime_transport" not in seen["body"]
     assert seen["body"]["task_callback"]["secret"] == "caller-secret"
 
 

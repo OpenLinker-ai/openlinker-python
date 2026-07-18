@@ -187,13 +187,36 @@ class TaskCallbackSubscription(Model):
 @dataclass
 class RunResponse(Model):
     run_id: str = ""
+    agent_id: str | None = None
+    agent_slug: str | None = None
+    agent_name: str | None = None
+    agent_connection_mode: str | None = None
     status: str = ""
+    input: Any = None
     output: Any = None
     error_code: str | None = None
     error_message: str | None = None
     cost_cents: int = 0
     duration_ms: int = 0
+    started_at: str = ""
+    finished_at: str | None = None
     source: str | None = None
+    runtime_contract_id: str = ""
+    runtime_transport: str | None = None
+    runtime_transport_reason: str | None = None
+    runtime_transport_changed_at: str | None = None
+    dispatch_state: str = ""
+    attempt_count: int = 0
+    max_attempts: int = 0
+    next_attempt_at: str | None = None
+    latest_attempt_id: str | None = None
+    active_attempt_id: str | None = None
+    cancel_state: str | None = None
+    cancel_requested_at: str | None = None
+    cancel_acknowledged_at: str | None = None
+    cancel_reason: str | None = None
+    dead_lettered_at: str | None = None
+    replay_of_run_id: str | None = None
     parent_run_id: str | None = None
     caller_agent_id: str | None = None
     billing_mode: str | None = None
@@ -202,6 +225,7 @@ class RunResponse(Model):
     requirement_evidence: Any = None
     evidence_summary: Any = None
     next_action: Any = None
+    replayed: bool = False
 
 
 @dataclass
