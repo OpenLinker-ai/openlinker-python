@@ -1,3 +1,3 @@
-from . import client, runtime
+from . import client, registration, runtime
 
-__all__ = ["client", "runtime"]
+__all__ = ["client", "registration", "runtime"]

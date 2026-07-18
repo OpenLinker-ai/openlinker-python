@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import secrets
 from collections.abc import AsyncIterator, Awaitable
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
@@ -30,6 +31,8 @@ from ..types import (
     ListRunEventsResponse,
     MarketListResponse,
     PlatformCallbackOptions,
+    RegisterAgentViaTokenRequest,
+    RegisterAgentViaTokenResponse,
     RunAgentRequest,
     RunArtifactResponse,
     RunMessageResponse,
@@ -92,6 +95,24 @@ def _quote(value: str) -> str:
     return quote(value, safe="")
 
 
+def _resolve_run_idempotency_key(value: str | None) -> str:
+    key = secrets.token_hex(32) if value is None else value
+    if (
+        not isinstance(key, str)
+        or not 1 <= len(key) <= 255
+        or any(ord(char) < 0x20 or ord(char) > 0x7E for char in key)
+    ):
+        raise ValueError("openlinker: idempotency_key must be 1-255 printable ASCII characters")
+    return key
+
+
+def _normalize_registration_connection_mode(value: str | None) -> str:
+    normalized = _clean(value).lower()
+    if normalized in {"", "runtime", "runtime_ws", "runtime_pull", "agent_node"}:
+        return "runtime"
+    return _clean(value)
+
+
 def _maybe_await(value: Any) -> Awaitable[Any]:
     if inspect.isawaitable(value):
         return value
@@ -122,6 +143,24 @@ def _retry_after(headers: httpx.Headers) -> timedelta | None:
     except (TypeError, ValueError, IndexError, OverflowError):
         return None
     return None
+
+
+async def _read_response_body(response: httpx.Response) -> bytes:
+    declared = response.headers.get("Content-Length")
+    if declared:
+        try:
+            declared_length = int(declared)
+        except ValueError:
+            declared_length = 0
+        if declared_length > MAX_RESPONSE_BODY_BYTES:
+            raise ValueError(f"openlinker: response body exceeds {MAX_RESPONSE_BODY_BYTES} bytes")
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > MAX_RESPONSE_BODY_BYTES:
+            raise ValueError(f"openlinker: response body exceeds {MAX_RESPONSE_BODY_BYTES} bytes")
+        body.extend(chunk)
+    return bytes(body)
 
 
 class Client:
@@ -200,16 +239,20 @@ class Client:
         body: Any = None,
         accept: str = "application/json",
         token: str = "",
+        headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         content = None
         if body is not None:
             content = json.dumps(to_json_value(body)).encode()
-        return await self._client.request(
+        request_headers = self._request_headers(accept, token, body is not None)
+        request_headers.update(headers or {})
+        request = self._client.build_request(
             method,
             self.endpoint(path, query),
             content=content,
-            headers=self._request_headers(accept, token, body is not None),
+            headers=request_headers,
         )
+        return await self._client.send(request, stream=True)
 
     async def _do(
         self,
@@ -219,34 +262,60 @@ class Client:
         query: dict[str, Any] | None = None,
         body: Any = None,
         out: type[T] | None = None,
+        headers: dict[str, str] | None = None,
+        token: str | None = None,
     ) -> T | dict[str, Any] | None:
+        result, _ = await self._do_with_response(
+            method,
+            path,
+            query=query,
+            body=body,
+            out=out,
+            headers=headers,
+            token=token,
+        )
+        return result
+
+    async def _do_with_response(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict[str, Any] | None = None,
+        body: Any = None,
+        out: type[T] | None = None,
+        headers: dict[str, str] | None = None,
+        token: str | None = None,
+    ) -> tuple[T | dict[str, Any] | None, httpx.Headers]:
         response = await self._request(
             method,
             path,
             query=query,
             body=body,
-            token=self.user_token,
+            token=self.user_token if token is None else token,
+            headers=headers,
         )
-        if response.status_code < 200 or response.status_code >= 300:
-            raise self._parse_error(response)
-        if response.status_code == 204:
-            return None
-        raw = response.content
-        if len(raw) > MAX_RESPONSE_BODY_BYTES:
-            raise ValueError(f"openlinker: response body exceeds {MAX_RESPONSE_BODY_BYTES} bytes")
-        if not raw:
-            return None
-        data = response.json()
-        if out is None:
-            return data
-        return out.from_dict(data)
+        try:
+            raw = b"" if response.status_code == 204 else await _read_response_body(response)
+            if response.status_code < 200 or response.status_code >= 300:
+                raise self._parse_error(response, raw)
+            response_headers = httpx.Headers(response.headers)
+            if response.status_code == 204 or not raw:
+                return None, response_headers
+            data = json.loads(raw)
+            if out is None:
+                return data, response_headers
+            return out.from_dict(data), response_headers
+        finally:
+            await response.aclose()
 
-    def _parse_error(self, response: httpx.Response) -> OpenLinkerError:
-        raw = response.content[:MAX_RESPONSE_BODY_BYTES]
+    def _parse_error(self, response: httpx.Response, raw: bytes | None = None) -> OpenLinkerError:
+        if raw is None:
+            raw = response.content[:MAX_RESPONSE_BODY_BYTES]
         parsed: dict[str, Any] = {}
         try:
-            parsed = response.json()
-        except ValueError:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
             pass
         err = parsed.get("error") if isinstance(parsed, dict) else None
         err = err if isinstance(err, dict) else {}
@@ -280,14 +349,29 @@ class Client:
         return await self._do("GET", f"/agents/{_quote(slug)}/{suffix}", out=AgentCardResponse)
 
     async def run_agent(self, req: RunAgentRequest | dict[str, Any]):
-        return await self._do(
-            "POST", "/run", body=maybe_model(req, RunAgentRequest), out=RunResponse
-        )
+        return await self._create_run("/run", req)
 
     async def start_agent_run(self, req: RunAgentRequest | dict[str, Any]):
-        return await self._do(
-            "POST", "/runs", body=maybe_model(req, RunAgentRequest), out=RunResponse
+        return await self._create_run("/runs", req)
+
+    async def _create_run(self, path: str, req: RunAgentRequest | dict[str, Any]):
+        request = maybe_model(req, RunAgentRequest)
+        key = _resolve_run_idempotency_key(request.idempotency_key)
+        body = request.to_dict()
+        body.pop("idempotency_key", None)
+        result, headers = await self._do_with_response(
+            "POST",
+            path,
+            body=body,
+            out=RunResponse,
+            headers={"Idempotency-Key": key},
         )
+        if (
+            isinstance(result, RunResponse)
+            and headers.get("Idempotency-Replayed", "").lower() == "true"
+        ):
+            result.replayed = True
+        return result
 
     async def get_run(self, run_id: str):
         return await self._do("GET", f"/runs/{_quote(run_id)}", out=RunResponse)
@@ -330,10 +414,8 @@ class Client:
             headers=self._request_headers("text/event-stream", self.user_token),
         ) as response:
             if response.status_code < 200 or response.status_code >= 300:
-                body = await response.aread()
-                raise self._parse_error(
-                    httpx.Response(response.status_code, headers=response.headers, content=body)
-                )
+                body = await _read_response_body(response)
+                raise self._parse_error(response, body)
             async for event in read_sse(response.aiter_lines()):
                 yield event
 
@@ -342,7 +424,9 @@ class Client:
     ):
         started = await self.start_agent_run(req)
         await self._stream_platform_callbacks(started.run_id, opts, until_terminal=True)
-        return await self.get_run(started.run_id)
+        result = await self.get_run(started.run_id)
+        result.replayed = result.replayed or started.replayed
+        return result
 
     async def start_agent_run_with_callbacks(
         self, req: RunAgentRequest | dict[str, Any], opts: PlatformCallbackOptions
@@ -431,6 +515,28 @@ class Client:
     async def revoke_agent_token(self, token_id: str) -> None:
         await self._do("DELETE", f"/creator/agent-tokens/{_quote(token_id)}")
 
+    async def register_agent_via_token(
+        self,
+        agent_token: str,
+        req: RegisterAgentViaTokenRequest | dict[str, Any],
+    ):
+        token = _clean(agent_token)
+        if not token:
+            raise ValueError("openlinker: Agent Token is required for registration")
+        request = maybe_model(req, RegisterAgentViaTokenRequest)
+        body = request.to_dict()
+        body["visibility"] = request.visibility or "private"
+        body["connection_mode"] = _normalize_registration_connection_mode(
+            request.connection_mode
+        )
+        return await self._do(
+            "POST",
+            "/agent-registration/agents",
+            body=body,
+            out=RegisterAgentViaTokenResponse,
+            token=token,
+        )
+
     def a2a_agent(self, slug: str):
         from ..a2a import A2AClient
 
@@ -464,6 +570,7 @@ class Client:
     CreateAgentToken = create_agent_token
     ListAgentTokens = list_agent_tokens
     RevokeAgentToken = revoke_agent_token
+    RegisterAgentViaToken = register_agent_via_token
     A2AAgent = a2a_agent
 
 

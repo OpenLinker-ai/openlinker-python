@@ -85,6 +85,7 @@ _PERMANENT_CODES = {
     "RUNTIME_SPOOL_CORRUPT",
 }
 _LEASE_TERMINAL_CODES = {"STALE_LEASE", "LEASE_EXPIRED", "RUN_ALREADY_TERMINAL"}
+_ASSIGNMENT_TERMINAL_CODES = _LEASE_TERMINAL_CODES | {"RUN_CANCEL_REQUESTED"}
 
 
 class _RuntimeStoppedBeforeDrain(RuntimeError):
@@ -277,7 +278,8 @@ class RuntimeWorker:
         self._active: dict[str, _ActiveAttempt] = {}
         self._attempt_locks: dict[str, asyncio.Lock] = {}
         self._spool_permissions: dict[str, tuple[bool, bool]] = {}
-        self._cancellations: set[str] = set()
+        self._cancellations: set[tuple[str, str]] = set()
+        self._terminal_attempts: set[str] = set()
         self._background: set[asyncio.Task[Any]] = set()
         self._websocket_probe_task: asyncio.Task[Any] | None = None
         self._claim_switch_lock = asyncio.Lock()
@@ -715,6 +717,9 @@ class RuntimeWorker:
 
     async def _handle_assignment(self, claimed: ClaimedAssignment) -> None:
         assignment = claimed.assignment
+        attempt_id = assignment.attempt_identity.attempt_id
+        if attempt_id in self._terminal_attempts:
+            return
         local = self._local_identity(assignment.attempt_identity)
         record = AssignmentRecord(
             identity=local,
@@ -735,15 +740,20 @@ class RuntimeWorker:
         if record.state == ASSIGNMENT_RECEIVED:
             record = store.advance_assignment(local.assignment_message_id, ASSIGNMENT_ACK_SENT)
         if record.state == ASSIGNMENT_ACK_SENT:
-            confirmation = await self._retry_call(
+            terminal, confirmation = await self._retry_assignment_operation(
+                assignment.attempt_identity,
                 lambda: self._transport_required().ack_assignment(
                     {"attempt_identity": assignment.attempt_identity.to_dict()},
                     delivery_id=claimed.delivery_id,
-                )
+                ),
             )
+            if terminal:
+                return
             self._validate_confirmation(assignment.attempt_identity, confirmation)
+            if attempt_id in self._terminal_attempts:
+                return
             record = store.advance_assignment(local.assignment_message_id, ASSIGNMENT_CONFIRMED)
-            self._spool_permissions[assignment.attempt_identity.attempt_id] = (True, True)
+            self._spool_permissions[attempt_id] = (True, True)
             await self._start_confirmed_attempt(
                 record, parse_datetime(confirmation["lease_expires_at"])
             )
@@ -753,14 +763,17 @@ class RuntimeWorker:
             await self._start_confirmed_attempt(record, None)
             return
         if record.state in {ASSIGNMENT_STARTED, ASSIGNMENT_FINISHED}:
-            confirmation = await self._retry_call(
+            terminal, confirmation = await self._retry_assignment_operation(
+                assignment.attempt_identity,
                 lambda: self._transport_required().ack_assignment(
                     {"attempt_identity": assignment.attempt_identity.to_dict()},
                     delivery_id=claimed.delivery_id,
-                )
+                ),
             )
+            if terminal:
+                return
             self._validate_confirmation(assignment.attempt_identity, confirmation)
-            active = self._active.get(assignment.attempt_identity.attempt_id)
+            active = self._active.get(attempt_id)
             if active is not None:
                 active.lease_expires_at = parse_datetime(confirmation["lease_expires_at"])
 
@@ -772,7 +785,8 @@ class RuntimeWorker:
             )
         capacity, inflight = self._capacity_snapshot()
         reason = "NODE_DRAINING" if self._draining else "NODE_AT_CAPACITY"
-        response = await self._retry_call(
+        terminal, response = await self._retry_assignment_operation(
+            record.identity.attempt,
             lambda: self._transport_required().reject_assignment(
                 {
                     "attempt_identity": record.identity.attempt.to_dict(),
@@ -781,8 +795,10 @@ class RuntimeWorker:
                     "inflight": inflight,
                 },
                 delivery_id=delivery_id,
-            )
+            ),
         )
+        if terminal:
+            return
         _require_response_keys(
             response,
             required={"attempt_identity", "outcome", "dispatch_state"},
@@ -795,13 +811,49 @@ class RuntimeWorker:
         store.advance_assignment(record.identity.assignment_message_id, ASSIGNMENT_REJECTED)
         store.delete_assignment(record.identity.assignment_message_id)
 
+    async def _retry_assignment_operation(
+        self,
+        identity: RuntimeAttemptIdentity,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> tuple[bool, Any]:
+        if identity.attempt_id in self._terminal_attempts:
+            return True, None
+        try:
+            value = await self._retry_call(operation)
+        except RuntimeRemoteError as exc:
+            if await self._converge_assignment_terminal_error(identity, exc):
+                return True, None
+            raise
+        if identity.attempt_id in self._terminal_attempts:
+            return True, None
+        return False, value
+
+    async def _converge_assignment_terminal_error(
+        self,
+        identity: RuntimeAttemptIdentity,
+        error: RuntimeRemoteError,
+    ) -> bool:
+        if error.code not in _ASSIGNMENT_TERMINAL_CODES:
+            return False
+        try:
+            record = self._store_required().assignment_for_attempt(identity.attempt_id)
+        except RuntimeStoreError as exc:
+            if str(exc) == "assignment not found":
+                self._terminal_attempts.add(identity.attempt_id)
+                return True
+            raise
+        if record.identity.attempt != identity:
+            raise RuntimeProtocolError("Runtime assignment terminal identity mismatch")
+        await self._revoke_attempt(record)
+        return True
+
     async def _start_confirmed_attempt(
         self,
         record: AssignmentRecord,
         lease_expires_at: datetime | None,
     ) -> None:
         attempt_id = record.identity.attempt.attempt_id
-        if attempt_id in self._active:
+        if attempt_id in self._active or attempt_id in self._terminal_attempts:
             return
         if record.state != ASSIGNMENT_CONFIRMED:
             raise RuntimeStoreError("handler requires a confirmed assignment")
@@ -1073,10 +1125,14 @@ class RuntimeWorker:
                 parse_datetime(payload["deadline_at"])
             except (TypeError, ValueError) as exc:
                 raise RuntimeProtocolError("Runtime cancellation deadline is invalid") from exc
-            if cancellation_id in self._cancellations:
+            identity = RuntimeAttemptIdentity.from_dict(
+                _protocol_object(payload.get("attempt_identity"), "cancel Attempt")
+            )
+            cancellation_key = (cancellation_id, identity.attempt_id)
+            if cancellation_key in self._cancellations:
                 return
-            self._cancellations.add(cancellation_id)
-            self._spawn(self._handle_cancel(payload))
+            self._cancellations.add(cancellation_key)
+            self._spawn(self._handle_cancel(payload, cancellation_key))
         elif command_type == "runtime.drain":
             validate_runtime_drain_payload(payload)
             self._draining = True
@@ -1107,46 +1163,111 @@ class RuntimeWorker:
         else:
             raise RuntimeProtocolError(f"unknown Runtime command {command_type!r}")
 
-    async def _handle_cancel(self, payload: dict[str, Any]) -> None:
+    async def _handle_cancel(
+        self,
+        payload: dict[str, Any],
+        cancellation_key: tuple[str, str],
+    ) -> None:
         cancellation_id = str(payload.get("cancellation_id", ""))
         _canonical_protocol_uuid(cancellation_id, "cancellation_id")
         identity = RuntimeAttemptIdentity.from_dict(
             _protocol_object(payload.get("attempt_identity"), "cancel Attempt")
         )
         try:
-            record = self._store_required().assignment_for_attempt(identity.attempt_id)
-        except RuntimeStoreError as exc:
-            if str(exc) != "assignment not found":
-                raise
-            await self._ack_cancel(payload, "failed", "ATTEMPT_IDENTITY_MISMATCH")
-            return
-        if record.identity.attempt != identity:
-            await self._ack_cancel(payload, "failed", "ATTEMPT_IDENTITY_MISMATCH")
-            return
-        await self._ack_cancel(payload, "stopping", "")
-        active = self._active.get(identity.attempt_id)
-        if active is not None:
-            active.cancel_event.set()
-            if active.task is not None:
-                active.task.cancel()
-        async with self._attempt_lock(identity.attempt_id):
-            self._spool_permissions.pop(identity.attempt_id, None)
-        if active is not None:
             deadline = parse_datetime(payload["deadline_at"])
-            timeout = max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
             try:
-                if active.task is not None:
-                    await asyncio.wait_for(
-                        asyncio.gather(active.task, return_exceptions=True), timeout=timeout
-                    )
-            except asyncio.TimeoutError:
-                await self._ack_cancel(payload, "failed", "CANCEL_DEADLINE_EXCEEDED")
+                record = self._store_required().assignment_for_attempt(identity.attempt_id)
+            except RuntimeStoreError as exc:
+                if str(exc) != "assignment not found":
+                    raise
+                await self._ack_cancel_best_effort(
+                    payload,
+                    "failed",
+                    "ATTEMPT_IDENTITY_MISMATCH",
+                    deadline,
+                )
                 return
-        await self._ack_cancel(payload, "stopped", "")
-        await self._finalize_revoked_attempt(record)
-        self.logger.debug("Runtime cancellation %s stopped", cancellation_id)
+            if record.identity.attempt != identity:
+                await self._ack_cancel_best_effort(
+                    payload,
+                    "failed",
+                    "ATTEMPT_IDENTITY_MISMATCH",
+                    deadline,
+                )
+                return
 
-    async def _ack_cancel(self, payload: dict[str, Any], state: str, error_code: str) -> None:
+            self._terminal_attempts.add(identity.attempt_id)
+            now = datetime.now(timezone.utc)
+            initial_remaining = max(0.0, (deadline - now).total_seconds())
+            stopping_budget = max(0.001, min(2.0, initial_remaining / 2))
+            stopping_deadline = min(deadline, now + timedelta(seconds=stopping_budget))
+            stopping_ack = asyncio.create_task(
+                self._ack_cancel(payload, "stopping", "", deadline=stopping_deadline)
+            )
+
+            active = self._active.get(identity.attempt_id)
+            if active is not None:
+                active.cancel_event.set()
+                if active.task is not None:
+                    active.task.cancel()
+            async with self._attempt_lock(identity.attempt_id):
+                self._spool_permissions.pop(identity.attempt_id, None)
+
+            handler_stopped = True
+            if active is not None and active.task is not None:
+                timeout = max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
+                done, _ = await asyncio.wait({active.task}, timeout=timeout)
+                handler_stopped = active.task in done
+
+            try:
+                await stopping_ack
+            except Exception as exc:
+                self.logger.warning(
+                    "Runtime cancel stopping ACK was not confirmed: %s", exc
+                )
+
+            if not handler_stopped:
+                await self._ack_cancel_best_effort(
+                    payload,
+                    "failed",
+                    "CANCEL_DEADLINE_EXCEEDED",
+                    deadline,
+                )
+                return
+            if not await self._ack_cancel_best_effort(
+                payload,
+                "stopped",
+                "",
+                deadline,
+            ):
+                return
+            await self._finalize_revoked_attempt(record)
+            self.logger.debug("Runtime cancellation %s stopped", cancellation_id)
+        finally:
+            self._cancellations.discard(cancellation_key)
+
+    async def _ack_cancel_best_effort(
+        self,
+        payload: dict[str, Any],
+        state: str,
+        error_code: str,
+        deadline: datetime,
+    ) -> bool:
+        try:
+            await self._ack_cancel(payload, state, error_code, deadline=deadline)
+            return True
+        except Exception as exc:
+            self.logger.warning("Runtime cancel %s ACK was not confirmed: %s", state, exc)
+            return False
+
+    async def _ack_cancel(
+        self,
+        payload: dict[str, Any],
+        state: str,
+        error_code: str,
+        *,
+        deadline: datetime | None = None,
+    ) -> None:
         request = {
             "cancellation_id": payload["cancellation_id"],
             "attempt_identity": payload["attempt_identity"],
@@ -1154,9 +1275,18 @@ class RuntimeWorker:
         }
         if error_code:
             request["error_code"] = error_code
+        deadline = deadline or parse_datetime(payload["deadline_at"])
+
+        async def send() -> dict[str, Any]:
+            remaining = max(0.001, (deadline - datetime.now(timezone.utc)).total_seconds())
+            return await asyncio.wait_for(
+                self._transport_required().ack_cancel(request),
+                timeout=remaining,
+            )
+
         response = await self._retry_call(
-            lambda: self._transport_required().ack_cancel(request),
-            deadline=parse_datetime(payload["deadline_at"]),
+            send,
+            deadline=deadline,
         )
         if response.get("cancellation_id") != payload["cancellation_id"]:
             raise RuntimeProtocolError("Runtime cancellation ACK identity mismatch")
@@ -1573,6 +1703,7 @@ class RuntimeWorker:
 
     async def _revoke_attempt(self, record: AssignmentRecord) -> None:
         attempt_id = record.identity.attempt.attempt_id
+        self._terminal_attempts.add(attempt_id)
         active = self._active.get(attempt_id)
         if active is not None:
             active.cancel_event.set()
