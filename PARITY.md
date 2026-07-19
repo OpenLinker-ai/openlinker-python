@@ -1,5 +1,7 @@
 # OpenLinker SDK parity
 
+[简体中文](PARITY.zh-CN.md)
+
 The Python SDK follows the same product boundary and canonical Runtime contract as
 `openlinker-go` and `openlinker-js`. Naming follows Python conventions; wire behavior
 is shared.

@@ -76,7 +76,7 @@ from openlinker import client
 
 async def main() -> None:
     async with client.Client(
-        os.environ["OPENLINKER_CORE_URL"],
+        os.environ["OPENLINKER_URL"],
         user_token=os.environ["OPENLINKER_USER_TOKEN"],
     ) as openlinker:
         agents = await openlinker.list_agents(
@@ -157,7 +157,7 @@ from openlinker.a2a import A2AMessage, A2AMessageSendParams
 
 async def main() -> None:
     async with client.Client(
-        os.environ["OPENLINKER_CORE_URL"],
+        os.environ["OPENLINKER_URL"],
         user_token=os.environ["OPENLINKER_USER_TOKEN"],
     ) as openlinker:
         a2a = openlinker.a2a_agent("research-agent")
@@ -234,16 +234,21 @@ async def handle(context: runtime.RuntimeContext) -> runtime.RuntimeResult:
 
 async def main() -> None:
     worker = runtime.RuntimeWorker(
-        platform_url=os.environ["OPENLINKER_CORE_URL"],
+        platform_url=os.environ["OPENLINKER_URL"],
+        runtime_url=os.environ.get("OPENLINKER_RUNTIME_URL", ""),
         node_id=os.environ["OPENLINKER_NODE_ID"],
         agent_id=os.environ["OPENLINKER_AGENT_ID"],
         agent_token=os.environ["OPENLINKER_AGENT_TOKEN"],
         mtls=runtime.RuntimeMTLS(
-            cert_file=os.environ["OPENLINKER_RUNTIME_CERT"],
-            key_file=os.environ["OPENLINKER_RUNTIME_KEY"],
-            ca_file=os.environ["OPENLINKER_RUNTIME_CA"],
+            cert_file=os.environ["OPENLINKER_RUNTIME_MTLS_CERT_FILE"],
+            key_file=os.environ["OPENLINKER_RUNTIME_MTLS_KEY_FILE"],
+            ca_file=os.environ["OPENLINKER_RUNTIME_MTLS_CA_FILE"],
         ),
-        data_dir="./.openlinker-runtime",
+        data_dir=os.environ.get(
+            "OPENLINKER_RUNTIME_DATA_DIR",
+            "./.openlinker-runtime",
+        ),
+        transport=os.environ.get("OPENLINKER_RUNTIME_TRANSPORT", "auto"),
         handler=handle,
     )
     await worker.run()

@@ -35,6 +35,16 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -e '.[dev]' build
 
+      - name: Check public documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f README.md
+          test -f README.zh-CN.md
+          test -f PARITY.md
+          test -f PARITY.zh-CN.md
+          ! grep -n -E 'OPENLINKER_CORE_URL|OPENLINKER_RUNTIME_CERT([^_]|$)|OPENLINKER_RUNTIME_KEY([^_]|$)|OPENLINKER_RUNTIME_CA([^_]|$)' +            README.md README.zh-CN.md
+
       - name: Lint
         run: python -m ruff check .
 
