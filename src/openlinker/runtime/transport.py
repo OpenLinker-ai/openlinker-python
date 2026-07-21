@@ -35,6 +35,7 @@ _DISCOVERY_PATH = "/.well-known/openlinker.json"
 _SDK_AGENT = "openlinker-python/runtime-worker"
 _ATTACHMENT_HEADER = "OpenLinker-Runtime-Attachment"
 RUNTIME_FALLBACK_REASON_HEADER = "OpenLinker-Runtime-Fallback-Reason"
+RUNTIME_NODE_ID_HEADER = "OpenLinker-Runtime-Node"
 RUNTIME_FALLBACK_REASONS = frozenset(
     {"explicit", "websocket_unavailable", "policy_forced", "recovery"}
 )
@@ -346,6 +347,7 @@ class HTTPRuntimeTransport:
         agent_token: str,
         mtls: RuntimeMTLS,
         *,
+        node_id: str,
         mtls_required: bool = True,
         credential_manager: Any = None,
         _client: httpx.AsyncClient | None = None,
@@ -355,6 +357,7 @@ class HTTPRuntimeTransport:
         )
         if not agent_token or agent_token != agent_token.strip():
             raise ValueError("Agent Token is required")
+        self.node_id = _runtime_node_id(node_id)
         self._agent_token = agent_token
         self._mtls = mtls
         self._mtls_required = mtls_required
@@ -594,6 +597,9 @@ class HTTPRuntimeTransport:
             attachment_generation = self._attachment_generation
             request_headers[_ATTACHMENT_HEADER] = attachment_id
         request_headers.update(headers or {})
+        # Node identity is transport-owned; callers cannot select a different
+        # Node by supplying an operation-specific header.
+        request_headers[RUNTIME_NODE_ID_HEADER] = self.node_id
         content = (
             raw_body
             if raw_body is not None
@@ -664,6 +670,7 @@ class WebSocketRuntimeTransport:
         self._mtls_required = mtls_required
         self._credential_manager = credential_manager
         self._http = http_transport
+        self._node_id = http_transport.node_id
         self._socket: Any = None
         self._hello: dict[str, Any] | None = None
         self._ready: RuntimeReady | None = None
@@ -706,6 +713,7 @@ class WebSocketRuntimeTransport:
         kwargs[header_name] = {
             "Authorization": f"Bearer {self._agent_token}",
             "X-OpenLinker-SDK": _SDK_AGENT,
+            RUNTIME_NODE_ID_HEADER: self._node_id,
         }
         if fallback_reason:
             kwargs[header_name][RUNTIME_FALLBACK_REASON_HEADER] = fallback_reason
@@ -1244,6 +1252,18 @@ def _runtime_session_id(value: Any) -> str:
         raise RuntimeProtocolError("Runtime Session identity is invalid") from exc
     if parsed.int == 0 or str(parsed) != value:
         raise RuntimeProtocolError("Runtime Session identity is invalid")
+    return value
+
+
+def _runtime_node_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Runtime Node identity must be a lowercase non-zero UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as exc:
+        raise ValueError("Runtime Node identity must be a lowercase non-zero UUID") from exc
+    if parsed.int == 0 or str(parsed) != value:
+        raise ValueError("Runtime Node identity must be a lowercase non-zero UUID")
     return value
 
 

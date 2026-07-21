@@ -32,6 +32,7 @@ from openlinker.runtime.worker import (
 ATTACHMENT_ID = "88888888-8888-4888-8888-888888888888"
 NEXT_ATTACHMENT_ID = "99999999-9999-4999-8999-999999999999"
 RUNTIME_SESSION_ID = "33333333-3333-4333-8333-333333333333"
+NODE_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def test_runtime_discovery_policy_fixtures_are_language_consistent():
@@ -199,6 +200,7 @@ async def test_http_runtime_uses_canonical_unversioned_path_and_agent_token():
             "https://runtime.example.test",
             "ol_agent_secret",
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            node_id=NODE_ID,
             _client=client,
         )
         await transport.create_session(
@@ -215,6 +217,7 @@ async def test_http_runtime_uses_canonical_unversioned_path_and_agent_token():
     assert seen[0].url.path == "/api/v1/agent-runtime/sessions"
     assert "/v2/" not in seen[0].url.path.lower()
     assert seen[0].headers["Authorization"] == "Bearer ol_agent_secret"
+    assert seen[0].headers["OpenLinker-Runtime-Node"] == NODE_ID
     assert seen[0].headers["OpenLinker-Runtime-Fallback-Reason"] == "explicit"
     assert "OpenLinker-Runtime-Attachment" not in seen[0].headers
     assert seen[1].headers["OpenLinker-Runtime-Attachment"] == ATTACHMENT_ID
@@ -255,6 +258,7 @@ async def test_http_runtime_drain_uses_attachment_and_authoritative_ack():
             "https://runtime.example.test",
             "ol_agent_secret",
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            node_id=NODE_ID,
             _client=client,
         )
         await transport.create_session({"runtime_session_id": RUNTIME_SESSION_ID})
@@ -322,6 +326,7 @@ async def test_websocket_runtime_drain_uses_correlated_bidirectional_ack():
             "https://runtime.example.test",
             "ol_agent_secret",
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            node_id=NODE_ID,
             _client=client,
         )
         websocket = WebSocketRuntimeTransport(
@@ -364,6 +369,7 @@ async def test_runtime_redirect_never_forwards_agent_credentials():
             "https://runtime.example.test",
             "ol_agent_secret",
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            node_id=NODE_ID,
             _client=client,
         )
         with pytest.raises(runtime.RuntimeProtocolError, match="redirect"):
@@ -388,6 +394,7 @@ async def test_invalid_heartbeat_ready_cannot_replace_the_attachment():
             "https://runtime.example.test",
             "ol_agent_secret",
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            node_id=NODE_ID,
             _client=client,
         )
         await transport.create_session({"runtime_session_id": "session"})
@@ -420,6 +427,7 @@ async def test_heartbeat_requires_the_exact_current_attachment():
             "https://runtime.example.test",
             "ol_agent_secret",
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            node_id=NODE_ID,
             _client=client,
         )
         await transport.create_session({"runtime_session_id": "session"})
@@ -459,6 +467,7 @@ async def test_inflight_pull_response_is_rejected_after_reattach():
             "https://runtime.example.test",
             "ol_agent_secret",
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            node_id=NODE_ID,
             _client=client,
         )
         await transport.create_session({"runtime_session_id": "session"})
@@ -496,6 +505,7 @@ async def test_websocket_heartbeat_allows_capacity_change_but_not_identity_chang
             "https://runtime.example.test",
             "ol_agent_secret",
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            node_id=NODE_ID,
             _client=client,
         )
         websocket = WebSocketRuntimeTransport(
@@ -540,6 +550,7 @@ async def test_websocket_upgrade_sends_only_a_bounded_fallback_reason(monkeypatc
             "https://runtime.example.test",
             "ol_agent_secret",
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            node_id=NODE_ID,
             _client=client,
         )
         websocket = WebSocketRuntimeTransport(
@@ -594,6 +605,7 @@ async def test_websocket_upgrade_decodes_exact_runtime_policy_error(monkeypatch)
             "https://runtime.example.test",
             "ol_agent_secret",
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            node_id=NODE_ID,
             _client=client,
         )
         websocket = WebSocketRuntimeTransport(
@@ -631,6 +643,7 @@ async def test_call_agent_signs_exactly_the_body_it_sends():
             "https://runtime.example.test",
             "ol_agent_secret",
             runtime.RuntimeMTLS("client.crt", "client.key", "ca.crt"),
+            node_id=NODE_ID,
             _client=client,
         )
         response = await transport.call_agent(

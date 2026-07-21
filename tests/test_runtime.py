@@ -348,6 +348,70 @@ def make_policy_worker(
 
 
 @pytest.mark.asyncio
+async def test_worker_token_only_mode_skips_runtime_credentials(monkeypatch):
+    captured: dict[str, Any] = {}
+    transport = FakeTransport()
+
+    async def discover(_platform_url):
+        return RuntimeDiscoveryConnection(
+            "https://runtime.example.test",
+            RuntimeTransportPolicy(("pull",), "pull"),
+            mtls_required=False,
+            credential_endpoint="not-a-valid-credential-endpoint",
+        )
+
+    def reject_credentials(*_args, **_kwargs):
+        raise AssertionError("token-only startup opened Runtime mTLS credentials")
+
+    def build_http(*_args, **kwargs):
+        captured.update(kwargs)
+        return transport
+
+    monkeypatch.setattr(runtime_worker_module, "discover_runtime_connection", discover)
+    monkeypatch.setattr(runtime_worker_module, "RuntimeCredentialManager", reject_credentials)
+    monkeypatch.setattr(runtime_worker_module, "HTTPRuntimeTransport", build_http)
+    worker = runtime.RuntimeWorker(
+        platform_url="https://platform.example.test",
+        node_id=NODE_ID,
+        agent_id=AGENT_ID,
+        agent_token="ol_agent_token_only",
+        store=runtime.MemoryRuntimeStore(),
+        allow_unsafe_memory_store=True,
+        handler=lambda _context: {},
+        transport="pull",
+    )
+
+    await worker._setup_transport()
+    assert worker._credential_manager is None
+    assert captured["node_id"] == NODE_ID
+    assert captured["mtls_required"] is False
+    assert captured["credential_manager"] is None
+
+
+@pytest.mark.asyncio
+async def test_worker_token_only_mode_requires_configured_identity(monkeypatch):
+    async def discover(_platform_url):
+        return RuntimeDiscoveryConnection(
+            "https://runtime.example.test",
+            RuntimeTransportPolicy(("pull",), "pull"),
+            mtls_required=False,
+        )
+
+    monkeypatch.setattr(runtime_worker_module, "discover_runtime_connection", discover)
+    worker = runtime.RuntimeWorker(
+        platform_url="https://platform.example.test",
+        agent_token="ol_agent_token_only",
+        store=runtime.MemoryRuntimeStore(),
+        allow_unsafe_memory_store=True,
+        handler=lambda _context: {},
+        transport="pull",
+    )
+
+    with pytest.raises(ValueError, match="required for token-only"):
+        await worker._setup_transport()
+
+
+@pytest.mark.asyncio
 async def test_assignment_is_durable_and_confirmed_before_handler_runs():
     store = runtime.MemoryRuntimeStore()
     transport = FakeTransport()
@@ -1302,6 +1366,41 @@ async def test_worker_policy_recovery_fails_closed_without_platform_or_allowed_e
     incompatible = make_policy_worker(runtime.MemoryRuntimeStore(), mode="pull")
     with pytest.raises(RuntimeError, match="configured Runtime transport 'pull' is not allowed"):
         await asyncio.wait_for(incompatible.run(), timeout=1)
+    assert discovery_calls == 2
+    assert factory_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_policy_recovery_rejects_mtls_requirement_change(monkeypatch):
+    discovery_calls = 0
+    factory_calls = 0
+
+    class PolicyTransport(FakeTransport):
+        async def claim_assignment(self, _wait, _request):
+            raise runtime.RuntimeRemoteError(
+                "FORBIDDEN", "RUNTIME_POLICY_CHANGED", status_code=403
+            )
+
+    async def discover(_platform_url):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return RuntimeDiscoveryConnection(
+            f"https://runtime-{discovery_calls}.example.test",
+            RuntimeTransportPolicy(("pull",), "pull"),
+            mtls_required=discovery_calls == 1,
+        )
+
+    def build_http(*_args, **_kwargs):
+        nonlocal factory_calls
+        factory_calls += 1
+        return PolicyTransport()
+
+    monkeypatch.setattr(runtime_worker_module, "discover_runtime_connection", discover)
+    monkeypatch.setattr(runtime_worker_module, "HTTPRuntimeTransport", build_http)
+    worker = make_policy_worker(runtime.MemoryRuntimeStore(), mode="pull")
+
+    with pytest.raises(RuntimeError, match="mTLS requirement changed"):
+        await asyncio.wait_for(worker.run(), timeout=1)
     assert discovery_calls == 2
     assert factory_calls == 1
 

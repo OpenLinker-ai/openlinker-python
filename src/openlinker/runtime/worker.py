@@ -548,7 +548,12 @@ class RuntimeWorker:
         self.runtime_url = validate_runtime_origin(
             origin, allow_loopback_http=not self._mtls_required
         )
-        if not explicit_mtls or not self._mtls_required:
+        if not self._mtls_required:
+            if not self.node_id or not self.agent_id:
+                raise ValueError(
+                    "node_id and agent_id are required for token-only Runtime transport"
+                )
+        elif not explicit_mtls:
             if self.data_dir is None:
                 raise ValueError("automatic Runtime credentials require data_dir")
             platform_origin = validate_platform_origin(self.platform_url)
@@ -576,6 +581,7 @@ class RuntimeWorker:
             self.runtime_url,
             self.agent_token,
             self.mtls,
+            node_id=self.node_id,
             mtls_required=self._mtls_required,
             credential_manager=self._credential_manager,
         )
@@ -1975,8 +1981,13 @@ class RuntimeWorker:
                 )
             )
         connection = await discover_runtime_connection(self.platform_url)
+        if connection.mtls_required != self._mtls_required:
+            raise RuntimePolicyRecoveryError(
+                RuntimeError(
+                    "Runtime mTLS requirement changed; restart the Worker to apply the new security mode"
+                )
+            )
         self._apply_transport_policy(connection.policy)
-        self._mtls_required = connection.mtls_required
         runtime_url = validate_runtime_origin(
             connection.runtime_origin, allow_loopback_http=not self._mtls_required
         )
@@ -1984,6 +1995,7 @@ class RuntimeWorker:
             runtime_url,
             self.agent_token,
             self.mtls,
+            node_id=self.node_id,
             mtls_required=self._mtls_required,
             credential_manager=self._credential_manager,
         )
