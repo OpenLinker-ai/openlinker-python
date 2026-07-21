@@ -357,7 +357,6 @@ async def test_worker_token_only_mode_skips_runtime_credentials(monkeypatch):
             "https://runtime.example.test",
             RuntimeTransportPolicy(("pull",), "pull"),
             mtls_required=False,
-            credential_endpoint="not-a-valid-credential-endpoint",
         )
 
     def reject_credentials(*_args, **_kwargs):
