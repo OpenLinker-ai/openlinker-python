@@ -108,9 +108,9 @@ class RuntimeDrainTimeoutError(RuntimeError):
 
 @dataclass(frozen=True)
 class RuntimeMTLS:
-    cert_file: str
-    key_file: str
-    ca_file: str
+    cert_file: str = ""
+    key_file: str = ""
+    ca_file: str = ""
     server_name: str = ""
 
 

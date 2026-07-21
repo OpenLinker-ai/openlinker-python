@@ -15,6 +15,8 @@ from typing import Any, Protocol
 
 from websockets.exceptions import ConnectionClosed
 
+from .credentials import RuntimeCredentialManager
+
 from .store import (
     ASSIGNMENT_ACK_SENT,
     ASSIGNMENT_CONFIRMED,
@@ -199,10 +201,10 @@ class RuntimeWorker:
         self,
         *,
         platform_url: str,
-        node_id: str,
-        agent_id: str,
+        node_id: str = "",
+        agent_id: str = "",
         agent_token: str,
-        mtls: RuntimeMTLS,
+        mtls: RuntimeMTLS | None = None,
         handler: RuntimeHandler | RuntimeHandlerCallable,
         data_dir: str | Path | None = None,
         store: RuntimeStore | None = None,
@@ -229,7 +231,7 @@ class RuntimeWorker:
         self.node_id = node_id
         self.agent_id = agent_id
         self.agent_token = agent_token.strip()
-        self.mtls = mtls
+        self.mtls = mtls or RuntimeMTLS()
         self.handler = handler
         self.data_dir = Path(data_dir).expanduser() if data_dir is not None else None
         self.store = store
@@ -293,6 +295,8 @@ class RuntimeWorker:
         self._policy_last_error: BaseException | None = None
         self._policy_terminal_error: RuntimePolicyRecoveryError | None = None
         self._attachment_reason = "explicit"
+        self._credential_manager: RuntimeCredentialManager | None = None
+        self._mtls_required = True
 
     async def run(self) -> None:
         if self._started:
@@ -530,13 +534,57 @@ class RuntimeWorker:
     async def _setup_transport(self) -> None:
         if self._transport is not None:
             return
+        explicit_mtls = bool(self.mtls.cert_file and self.mtls.key_file and self.mtls.ca_file)
+        connection = None
         origin = self.runtime_url
-        if not origin:
+        if not origin or not explicit_mtls:
+            if not self.platform_url:
+                raise ValueError("automatic Runtime credentials require platform_url")
             connection = await discover_runtime_connection(self.platform_url)
-            origin = connection.runtime_origin
+            if not origin:
+                origin = connection.runtime_origin
             self._apply_transport_policy(connection.policy)
-        self.runtime_url = validate_runtime_origin(origin)
-        self._http_transport = HTTPRuntimeTransport(self.runtime_url, self.agent_token, self.mtls)
+        self._mtls_required = connection.mtls_required if connection is not None else True
+        self.runtime_url = validate_runtime_origin(
+            origin, allow_loopback_http=not self._mtls_required
+        )
+        if not self._mtls_required:
+            if not self.node_id or not self.agent_id:
+                raise ValueError(
+                    "node_id and agent_id are required for token-only Runtime transport"
+                )
+        elif not explicit_mtls:
+            if self.data_dir is None:
+                raise ValueError("automatic Runtime credentials require data_dir")
+            platform_origin = validate_platform_origin(self.platform_url)
+            endpoint = (
+                connection.credential_endpoint if connection is not None else ""
+            ) or platform_origin + "/api/v1/runtime-credentials"
+            manager = RuntimeCredentialManager(
+                data_dir=self.data_dir,
+                credential_endpoint=endpoint,
+                agent_token=self.agent_token,
+                node_id=self.node_id,
+                agent_id=self.agent_id,
+                node_version=self.node_version,
+                capacity=self.capacity,
+                logger=self.logger,
+            )
+            await manager.open()
+            await manager.ensure()
+            identity = manager.identity
+            self.node_id, self.agent_id = identity.node_id, identity.agent_id
+            self.mtls = manager.mtls
+            self._credential_manager = manager
+            manager.start()
+        self._http_transport = HTTPRuntimeTransport(
+            self.runtime_url,
+            self.agent_token,
+            self.mtls,
+            node_id=self.node_id,
+            mtls_required=self._mtls_required,
+            credential_manager=self._credential_manager,
+        )
         selected_reason = resolve_runtime_fallback_reason(
             self._configured_transport_mode, "policy_selected"
         )
@@ -560,6 +608,8 @@ class RuntimeWorker:
                 self.agent_token,
                 self.mtls,
                 self._http_transport,
+                mtls_required=self._mtls_required,
+                credential_manager=self._credential_manager,
             )
             await websocket.connect(self._hello(), fallback_reason=selected_reason)
             self._transport = websocket
@@ -606,6 +656,8 @@ class RuntimeWorker:
                 self.agent_token,
                 self.mtls,
                 self._http_transport,
+                mtls_required=self._mtls_required,
+                credential_manager=self._credential_manager,
             )
             try:
                 await websocket.connect(self._hello(), fallback_reason=fallback_reason)
@@ -1222,9 +1274,7 @@ class RuntimeWorker:
             try:
                 await stopping_ack
             except Exception as exc:
-                self.logger.warning(
-                    "Runtime cancel stopping ACK was not confirmed: %s", exc
-                )
+                self.logger.warning("Runtime cancel stopping ACK was not confirmed: %s", exc)
 
             if not handler_stopped:
                 await self._ack_cancel_best_effort(
@@ -1788,6 +1838,8 @@ class RuntimeWorker:
         transports = {id(item): item for item in (self._transport, self._http_transport) if item}
         for transport in transports.values():
             await transport.close()
+        if self._credential_manager is not None:
+            await self._credential_manager.close()
         if self._store is not None:
             self._store.close()
 
@@ -1929,9 +1981,24 @@ class RuntimeWorker:
                 )
             )
         connection = await discover_runtime_connection(self.platform_url)
+        if connection.mtls_required != self._mtls_required:
+            raise RuntimePolicyRecoveryError(
+                RuntimeError(
+                    "Runtime mTLS requirement changed; restart the Worker to apply the new security mode"
+                )
+            )
         self._apply_transport_policy(connection.policy)
-        runtime_url = validate_runtime_origin(connection.runtime_origin)
-        replacement_http = HTTPRuntimeTransport(runtime_url, self.agent_token, self.mtls)
+        runtime_url = validate_runtime_origin(
+            connection.runtime_origin, allow_loopback_http=not self._mtls_required
+        )
+        replacement_http = HTTPRuntimeTransport(
+            runtime_url,
+            self.agent_token,
+            self.mtls,
+            node_id=self.node_id,
+            mtls_required=self._mtls_required,
+            credential_manager=self._credential_manager,
+        )
         previous_transport = self._transport
         previous_http = self._http_transport
         replacement: RuntimeTransport = replacement_http
@@ -1947,6 +2014,8 @@ class RuntimeWorker:
                     self.agent_token,
                     self.mtls,
                     replacement_http,
+                    mtls_required=self._mtls_required,
+                    credential_manager=self._credential_manager,
                 )
                 try:
                     await websocket.connect(self._hello(), fallback_reason=reason)
@@ -2161,6 +2230,8 @@ class RuntimeWorker:
             self.agent_token,
             self.mtls,
             self._http_transport,
+            mtls_required=self._mtls_required,
+            credential_manager=self._credential_manager,
         )
         try:
             await websocket.connect(self._hello(), fallback_reason="recovery")
@@ -2215,14 +2286,26 @@ class RuntimeWorker:
         return self._auto_prefers_websocket() and "pull" in self._transport_order[1:]
 
     def _validate_config(self) -> None:
-        _canonical_uuid(self.node_id, "node_id")
-        _canonical_uuid(self.agent_id, "agent_id")
+        if self.node_id:
+            _canonical_uuid(self.node_id, "node_id")
+        if self.agent_id:
+            _canonical_uuid(self.agent_id, "agent_id")
         if not self.agent_token or self.agent_token.startswith("ol_user_"):
             raise ValueError("Agent Token is required and must not be a User Token")
-        if not self.mtls.cert_file or not self.mtls.key_file or not self.mtls.ca_file:
-            raise ValueError("Runtime mTLS cert, key, and CA files are required")
+        mtls_fields = sum(
+            bool(value) for value in (self.mtls.cert_file, self.mtls.key_file, self.mtls.ca_file)
+        )
+        if mtls_fields not in {0, 3}:
+            raise ValueError("Runtime mTLS files must be configured together")
+        if mtls_fields == 3 and (not self.node_id or not self.agent_id):
+            raise ValueError("node_id and agent_id are required with explicit mTLS files")
+        if mtls_fields == 0 and not self.platform_url:
+            raise ValueError("automatic Runtime credentials require platform_url")
         if self.runtime_url:
-            validate_runtime_origin(self.runtime_url)
+            # The discovery manifest remains authoritative. This preliminary
+            # validation permits only loopback HTTP until discovery confirms
+            # that the operator explicitly disabled mTLS.
+            validate_runtime_origin(self.runtime_url, allow_loopback_http=mtls_fields == 0)
         else:
             validate_platform_origin(self.platform_url)
         if self._configured_transport_mode not in {"auto", "ws", "pull"}:

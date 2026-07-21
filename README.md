@@ -235,15 +235,7 @@ async def handle(context: runtime.RuntimeContext) -> runtime.RuntimeResult:
 async def main() -> None:
     worker = runtime.RuntimeWorker(
         platform_url=os.environ["OPENLINKER_URL"],
-        runtime_url=os.environ.get("OPENLINKER_RUNTIME_URL", ""),
-        node_id=os.environ["OPENLINKER_NODE_ID"],
-        agent_id=os.environ["OPENLINKER_AGENT_ID"],
         agent_token=os.environ["OPENLINKER_AGENT_TOKEN"],
-        mtls=runtime.RuntimeMTLS(
-            cert_file=os.environ["OPENLINKER_RUNTIME_MTLS_CERT_FILE"],
-            key_file=os.environ["OPENLINKER_RUNTIME_MTLS_KEY_FILE"],
-            ca_file=os.environ["OPENLINKER_RUNTIME_MTLS_CA_FILE"],
-        ),
         data_dir=os.environ.get(
             "OPENLINKER_RUNTIME_DATA_DIR",
             "./.openlinker-runtime",
@@ -261,6 +253,9 @@ A worker is async and single-use. Events and results are encrypted and fsynced
 before upload. Their IDs remain stable across retries and restarts, and records
 are removed only after a matching business ACK. The file store keeps a stable
 worker identity while rotating the Session identity for each process start.
+The SDK also generates the Node private key in `data_dir`, enrolls it with the
+Agent Token, and renews its 24-hour client certificate automatically. Explicit
+`RuntimeMTLS` file paths are only needed for external-PKI compatibility.
 
 `MemoryRuntimeStore` is for explicit tests only and requires
 `allow_unsafe_memory_store=True`. Production workers should use `data_dir` or
