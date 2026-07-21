@@ -1737,7 +1737,7 @@ def test_memory_store_requires_an_explicit_unsafe_opt_in():
         )
 
 
-def test_worker_rejects_user_token_and_missing_mtls():
+def test_worker_rejects_user_token_and_partial_explicit_mtls():
     common = {
         "platform_url": "https://platform.example.test",
         "node_id": NODE_ID,
@@ -1756,5 +1756,5 @@ def test_worker_rejects_user_token_and_missing_mtls():
         runtime.RuntimeWorker(
             **common,
             agent_token="ol_agent_test",
-            mtls=runtime.RuntimeMTLS("", "", ""),
+            mtls=runtime.RuntimeMTLS("client.crt", "", ""),
         )

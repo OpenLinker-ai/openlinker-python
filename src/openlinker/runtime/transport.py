@@ -94,6 +94,9 @@ class RuntimeTransportPolicy:
 class RuntimeDiscoveryConnection:
     runtime_origin: str
     policy: RuntimeTransportPolicy
+    mtls_required: bool = True
+    credential_endpoint: str = ""
+    trust_bundle_endpoint: str = ""
 
 
 class RuntimeTransport(Protocol):
@@ -188,14 +191,19 @@ def decode_runtime_discovery_manifest(manifest: dict[str, Any]) -> RuntimeDiscov
     runtime = manifest.get("runtime")
     if not isinstance(base_urls, dict) or not isinstance(runtime, dict):
         raise RuntimeProtocolError("OpenLinker does not provide Runtime discovery")
-    if runtime.get("enabled") is not True or runtime.get("mtls_required") is not True:
-        raise RuntimeProtocolError("OpenLinker Runtime is disabled or does not require mTLS")
+    if runtime.get("enabled") is not True or not isinstance(runtime.get("mtls_required"), bool):
+        raise RuntimeProtocolError("OpenLinker Runtime is disabled or has no transport policy")
     discovered = base_urls.get("runtime")
     if not isinstance(discovered, str) or not discovered:
         raise RuntimeProtocolError("OpenLinker does not provide a Runtime origin")
     return RuntimeDiscoveryConnection(
-        runtime_origin=validate_runtime_origin(discovered),
+        runtime_origin=validate_runtime_origin(
+            discovered, allow_loopback_http=runtime["mtls_required"] is False
+        ),
         policy=decode_runtime_transport_policy(runtime),
+        mtls_required=runtime["mtls_required"],
+        credential_endpoint=str(runtime.get("credential_endpoint", "")),
+        trust_bundle_endpoint=str(runtime.get("trust_bundle_endpoint", "")),
     )
 
 
@@ -312,8 +320,8 @@ def validate_platform_origin(value: str) -> str:
     return _validate_origin(value, runtime=False)
 
 
-def validate_runtime_origin(value: str) -> str:
-    return _validate_origin(value, runtime=True)
+def validate_runtime_origin(value: str, *, allow_loopback_http: bool = False) -> str:
+    return _validate_origin(value, runtime=not allow_loopback_http)
 
 
 def build_runtime_ssl_context(config: RuntimeMTLS) -> ssl.SSLContext:
@@ -338,12 +346,19 @@ class HTTPRuntimeTransport:
         agent_token: str,
         mtls: RuntimeMTLS,
         *,
+        mtls_required: bool = True,
+        credential_manager: Any = None,
         _client: httpx.AsyncClient | None = None,
     ) -> None:
-        self.runtime_origin = validate_runtime_origin(runtime_origin)
+        self.runtime_origin = validate_runtime_origin(
+            runtime_origin, allow_loopback_http=not mtls_required
+        )
         if not agent_token or agent_token != agent_token.strip():
             raise ValueError("Agent Token is required")
         self._agent_token = agent_token
+        self._mtls = mtls
+        self._mtls_required = mtls_required
+        self._credential_manager = credential_manager
         self._attachment_id = ""
         self._attachment_generation = 0
         self._attachment_transition = asyncio.Lock()
@@ -351,7 +366,9 @@ class HTTPRuntimeTransport:
         if _client is not None:
             self._client = _client
         else:
-            ssl_context = build_runtime_ssl_context(mtls)
+            ssl_context: ssl.SSLContext | bool = (
+                build_runtime_ssl_context(mtls) if mtls_required else True
+            )
             if mtls.server_name:
                 hostname = urlparse(self.runtime_origin).hostname or ""
                 if mtls.server_name != hostname:
@@ -582,9 +599,32 @@ class HTTPRuntimeTransport:
             if raw_body is not None
             else (wire_json_bytes(body) if body is not None else None)
         )
-        response = await self._client.request(
-            method, url, content=content, headers=request_headers, follow_redirects=False
-        )
+        if self._credential_manager is not None:
+            await self._credential_manager.ensure(False)
+        try:
+            response = await self._client.request(
+                method, url, content=content, headers=request_headers, follow_redirects=False
+            )
+        except httpx.TransportError as exc:
+            if self._credential_manager is None or not _credential_tls_failure(exc):
+                raise
+            await self._credential_manager.ensure(True)
+            if self._owns_client:
+                await self._client.aclose()
+                verify: ssl.SSLContext | bool = (
+                    build_runtime_ssl_context(self._credential_manager.mtls)
+                    if self._mtls_required
+                    else True
+                )
+                self._client = httpx.AsyncClient(
+                    verify=verify,
+                    timeout=httpx.Timeout(35.0, connect=10.0, write=10.0, pool=5.0),
+                    follow_redirects=False,
+                    trust_env=False,
+                )
+            response = await self._client.request(
+                method, url, content=content, headers=request_headers, follow_redirects=False
+            )
         if attachment_generation is not None and (
             attachment_generation != self._attachment_generation
             or attachment_id != self._attachment_id
@@ -612,10 +652,17 @@ class WebSocketRuntimeTransport:
         agent_token: str,
         mtls: RuntimeMTLS,
         http_transport: HTTPRuntimeTransport,
+        *,
+        mtls_required: bool = True,
+        credential_manager: Any = None,
     ) -> None:
-        self.runtime_origin = validate_runtime_origin(runtime_origin)
+        self.runtime_origin = validate_runtime_origin(
+            runtime_origin, allow_loopback_http=not mtls_required
+        )
         self._agent_token = agent_token
         self._mtls = mtls
+        self._mtls_required = mtls_required
+        self._credential_manager = credential_manager
         self._http = http_transport
         self._socket: Any = None
         self._hello: dict[str, Any] | None = None
@@ -635,8 +682,15 @@ class WebSocketRuntimeTransport:
             raise RuntimeError("Runtime WebSocket is already connected")
         _validate_fallback_reason(fallback_reason)
         parsed = urlparse(self.runtime_origin)
-        uri = urlunparse(parsed._replace(scheme="wss", path=RUNTIME_WEBSOCKET_PATH))
-        ssl_context = build_runtime_ssl_context(self._mtls)
+        uri = urlunparse(
+            parsed._replace(
+                scheme="wss" if self._mtls_required else "ws",
+                path=RUNTIME_WEBSOCKET_PATH,
+            )
+        )
+        if self._credential_manager is not None:
+            await self._credential_manager.ensure(False)
+        ssl_context = build_runtime_ssl_context(self._mtls) if self._mtls_required else None
         kwargs: dict[str, Any] = {
             "ssl": ssl_context,
             "max_size": RUNTIME_MAX_MESSAGE_BYTES,
@@ -655,15 +709,31 @@ class WebSocketRuntimeTransport:
         }
         if fallback_reason:
             kwargs[header_name][RUNTIME_FALLBACK_REASON_HEADER] = fallback_reason
-        if self._mtls.server_name:
+        if self._mtls_required and self._mtls.server_name:
             kwargs["server_hostname"] = self._mtls.server_name
         try:
             self._socket = await websockets.connect(uri, **kwargs)
         except Exception as exc:
-            translated = _websocket_upgrade_error(exc)
-            if translated is not None:
-                raise translated from exc
-            raise
+            if (
+                self._credential_manager is not None
+                and self._mtls_required
+                and _credential_tls_failure(exc)
+            ):
+                try:
+                    await self._credential_manager.ensure(True)
+                    self._mtls = self._credential_manager.mtls
+                    kwargs["ssl"] = build_runtime_ssl_context(self._mtls)
+                    self._socket = await websockets.connect(uri, **kwargs)
+                except Exception as retry_exc:
+                    translated = _websocket_upgrade_error(retry_exc)
+                    if translated is not None:
+                        raise translated from retry_exc
+                    raise
+            else:
+                translated = _websocket_upgrade_error(exc)
+                if translated is not None:
+                    raise translated from exc
+                raise
         self._hello = dict(hello)
         hello_id = await self._send_envelope("runtime.hello", hello)
         try:
@@ -1203,6 +1273,13 @@ def _websocket_upgrade_error(exc: BaseException) -> RuntimeRemoteError | None:
         )
     except RuntimeProtocolError:
         return None
+
+
+def _credential_tls_failure(exc: BaseException) -> bool:
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        marker in message for marker in ("tls", "ssl", "x509", "certificate", "unknown authority")
+    )
 
 
 __all__ = [
