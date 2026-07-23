@@ -18,6 +18,12 @@ This is a pre-1.0 breaking Runtime cutover.
   protocol generation.
 - Documented Agent Node as an optional migration adapter rather than the default
   Runtime path.
+- Token-only Workers now derive a deterministic, token-scoped Node ID when
+  `node_id` is omitted; explicit mTLS deployments still require their
+  provisioned Node identity.
+- Classified only enumerated permanent HTTP error and WebSocket close shapes as
+  fatal. Unknown auth-like failures remain recoverable for DB-backed
+  revalidation.
 - Added complete bilingual repository, contribution, security, support, release,
   package metadata, typing marker, and MIT license files for the first public
   Python SDK release.

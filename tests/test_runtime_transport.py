@@ -35,6 +35,27 @@ RUNTIME_SESSION_ID = "33333333-3333-4333-8333-333333333333"
 NODE_ID = "11111111-1111-4111-8111-111111111111"
 
 
+def test_runtime_error_body_accepts_future_well_formed_codes():
+    error = runtime_transport._parse_error_body(
+        {
+            "code": "AUTH_BACKEND_BUSY",
+            "message": "temporary authentication backend failure",
+        },
+        status_code=401,
+    )
+    assert isinstance(error, runtime.RuntimeRemoteError)
+    assert error.code == "AUTH_BACKEND_BUSY"
+    assert error.status_code == 401
+
+
+def test_runtime_error_body_still_rejects_malformed_codes():
+    with pytest.raises(runtime.RuntimeProtocolError, match="invalid error code"):
+        runtime_transport._parse_error_body(
+            {"code": "auth backend busy", "message": "invalid"},
+            status_code=401,
+        )
+
+
 def test_runtime_discovery_policy_fixtures_are_language_consistent():
     fixture = json.loads(
         (Path(__file__).parents[1] / "contracts/runtime-discovery-policy-fixtures.json").read_text()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import random
@@ -78,6 +79,7 @@ DEFAULT_DRAIN_REASON = "SDK_GRACEFUL_SHUTDOWN"
 DEFAULT_NODE_VERSION = "openlinker-python/runtime-worker"
 
 _PERMANENT_CODES = {
+    "AUTHENTICATION_FAILED",
     "UNAUTHORIZED",
     "FORBIDDEN",
     "PERMISSION_DENIED",
@@ -86,6 +88,7 @@ _PERMANENT_CODES = {
     "RUNTIME_SESSION_CONFLICT",
     "RUNTIME_SPOOL_CORRUPT",
 }
+_PERMANENT_WEBSOCKET_CLOSE_CODES = {4401, 4406, 4409, 4412}
 _LEASE_TERMINAL_CODES = {"STALE_LEASE", "LEASE_EXPIRED", "RUN_ALREADY_TERMINAL"}
 _ASSIGNMENT_TERMINAL_CODES = _LEASE_TERMINAL_CODES | {"RUN_CANCEL_REQUESTED"}
 
@@ -549,10 +552,12 @@ class RuntimeWorker:
             origin, allow_loopback_http=not self._mtls_required
         )
         if not self._mtls_required:
-            if not self.node_id or not self.agent_id:
+            if not self.agent_id:
                 raise ValueError(
-                    "node_id and agent_id are required for token-only Runtime transport"
+                    "agent_id is required for token-only Runtime transport"
                 )
+            if not self.node_id:
+                self.node_id = _token_scoped_runtime_node_id(self.agent_token)
         elif not explicit_mtls:
             if self.data_dir is None:
                 raise ValueError("automatic Runtime credentials require data_dir")
@@ -2102,7 +2107,8 @@ class RuntimeWorker:
                         await self._wait_or_stop(self.retry_minimum)
                     continue
                 if _fatal_error(exc) or (
-                    isinstance(exc, RuntimeRemoteError) and exc.code in _LEASE_TERMINAL_CODES
+                    isinstance(exc, RuntimeRemoteError)
+                    and exc.code in _ASSIGNMENT_TERMINAL_CODES
                 ):
                     raise
                 if deadline is not None and datetime.now(timezone.utc) >= deadline:
@@ -2425,9 +2431,13 @@ def _fatal_error(exc: BaseException) -> bool:
         return True
     if isinstance(exc, (RuntimeProtocolError, RuntimeStoreError)):
         return True
-    return isinstance(exc, RuntimeRemoteError) and (
-        exc.code in _PERMANENT_CODES or (not exc.retryable and 400 <= exc.status_code < 500)
-    )
+    if isinstance(exc, RuntimeRemoteError):
+        return exc.code in _PERMANENT_CODES
+    if isinstance(exc, ConnectionClosed):
+        received = getattr(exc, "rcvd", None)
+        code = getattr(received, "code", None) if received is not None else getattr(exc, "code", None)
+        return code in _PERMANENT_WEBSOCKET_CLOSE_CODES
+    return False
 
 
 def _session_conflict(exc: BaseException) -> bool:
@@ -2612,6 +2622,17 @@ def _canonical_uuid(value: str, label: str) -> None:
         raise ValueError(f"{label} must be a UUID") from exc
     if parsed.int == 0 or str(parsed) != value:
         raise ValueError(f"{label} must be a lowercase non-zero UUID")
+
+
+def _token_scoped_runtime_node_id(agent_token: str) -> str:
+    digest = hashlib.sha256(
+        b"openlinker/runtime-worker/token-scoped-node/v1\x00"
+        + agent_token.encode("utf-8")
+    ).digest()
+    value = bytearray(digest[:16])
+    value[6] = (value[6] & 0x0F) | 0x50
+    value[8] = (value[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(value)))
 
 
 def _canonical_protocol_uuid(value: str, label: str) -> None:

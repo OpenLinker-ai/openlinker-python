@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import ssl
 import uuid
 from dataclasses import dataclass
@@ -39,38 +40,7 @@ RUNTIME_NODE_ID_HEADER = "OpenLinker-Runtime-Node"
 RUNTIME_FALLBACK_REASONS = frozenset(
     {"explicit", "websocket_unavailable", "policy_forced", "recovery"}
 )
-_ERROR_CODES = {
-    "BAD_REQUEST",
-    "UNAUTHORIZED",
-    "FORBIDDEN",
-    "PERMISSION_DENIED",
-    "NOT_FOUND",
-    "CONFLICT",
-    "VALIDATION_FAILED",
-    "RATE_LIMITED",
-    "INTERNAL_ERROR",
-    "SERVICE_UNAVAILABLE",
-    "IDEMPOTENCY_KEY_REUSED",
-    "RUN_ALREADY_TERMINAL",
-    "STALE_LEASE",
-    "LEASE_EXPIRED",
-    "LEASE_IDENTITY_MISMATCH",
-    "RESULT_ID_CONFLICT",
-    "EVENT_ID_CONFLICT",
-    "NODE_AT_CAPACITY",
-    "RUNTIME_CLIENT_UPGRADE_REQUIRED",
-    "RUNTIME_REQUIRED_FEATURE_MISSING",
-    "RUN_CANCEL_REQUESTED",
-    "RUN_CANCEL_UNCONFIRMED",
-    "RUNTIME_RETRY_EXHAUSTED",
-    "RUNTIME_DISPATCH_TIMEOUT",
-    "RUN_DEADLINE_EXCEEDED",
-    "EVENTS_MISSING",
-    "REPLAY_INPUT_UNAVAILABLE",
-    "ENDPOINT_RESULT_UNKNOWN",
-    "RUNTIME_SESSION_CONFLICT",
-    "RUNTIME_SPOOL_CORRUPT",
-}
+_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,119}$")
 
 
 @dataclass(frozen=True)
@@ -1129,8 +1099,11 @@ def _parse_error_body(value: dict[str, Any], *, status_code: int = 0) -> Runtime
     code = value["code"]
     message = value["message"]
     retryable = value.get("retryable", False)
-    if not isinstance(code, str) or code not in _ERROR_CODES:
-        raise RuntimeProtocolError("Runtime returned an unknown error code")
+    # Error bodies remain structurally strict, but the code enumeration is
+    # deliberately forward-compatible. Worker fatality is a best-effort
+    # classifier: only explicitly known permanent codes may terminate it.
+    if not isinstance(code, str) or _ERROR_CODE.fullmatch(code) is None:
+        raise RuntimeProtocolError("Runtime returned an invalid error code")
     if not isinstance(message, str) or not 1 <= len(message) <= 500:
         raise RuntimeProtocolError("Runtime error message is invalid")
     if not isinstance(retryable, bool):
