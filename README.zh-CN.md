@@ -205,7 +205,7 @@ asyncio.run(main())
 
 ## Runtime Worker
 
-`RuntimeWorker` 负责 Runtime 发现、mTLS、Session attach、WebSocket 主链路与 HTTPS
+`RuntimeWorker` 负责 Runtime 发现、token-only/mTLS 安全策略、Session attach、WebSocket 主链路与 HTTPS
 长轮询回退、任务确认、租约续期、恢复、取消、drain 和关闭。只有 Core 确认任务后才会
 执行 Handler。
 
@@ -225,15 +225,8 @@ async def handle(context: runtime.RuntimeContext) -> runtime.RuntimeResult:
 async def main() -> None:
     worker = runtime.RuntimeWorker(
         platform_url=os.environ["OPENLINKER_URL"],
-        runtime_url=os.environ.get("OPENLINKER_RUNTIME_URL", ""),
-        node_id=os.environ["OPENLINKER_NODE_ID"],
         agent_id=os.environ["OPENLINKER_AGENT_ID"],
         agent_token=os.environ["OPENLINKER_AGENT_TOKEN"],
-        mtls=runtime.RuntimeMTLS(
-            cert_file=os.environ["OPENLINKER_RUNTIME_MTLS_CERT_FILE"],
-            key_file=os.environ["OPENLINKER_RUNTIME_MTLS_KEY_FILE"],
-            ca_file=os.environ["OPENLINKER_RUNTIME_MTLS_CA_FILE"],
-        ),
         data_dir=os.environ.get(
             "OPENLINKER_RUNTIME_DATA_DIR",
             "./.openlinker-runtime",
@@ -246,6 +239,10 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
+
+发现选择 token-only 且省略 `node_id` 时，SDK 会派生与 Go/TypeScript SDK 一致、仅限该
+Agent Token 的稳定 Node ID。发现要求 mTLS 时由 SDK 自动登记；只有外部 PKI 兼容模式才需
+显式证书文件。
 
 Worker 是异步且一次性的。Event 和 Result 会在上传前加密并 fsync；重试和重启不会改变
 它们的 ID，只有取得匹配的业务 ACK 后才会删除记录。文件 Store 会保留稳定的 worker

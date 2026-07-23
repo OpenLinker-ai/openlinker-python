@@ -214,7 +214,7 @@ asyncio.run(main())
 
 ## Runtime Worker
 
-`RuntimeWorker` owns Runtime discovery, mTLS, Session attachment, WebSocket-first
+`RuntimeWorker` owns Runtime discovery, token-only or mTLS security, Session attachment, WebSocket-first
 delivery with HTTPS long-poll fallback, assignment confirmation, lease renewal,
 resume, cancellation, drain, and shutdown. The handler starts only after Core
 confirms the assignment.
@@ -235,6 +235,7 @@ async def handle(context: runtime.RuntimeContext) -> runtime.RuntimeResult:
 async def main() -> None:
     worker = runtime.RuntimeWorker(
         platform_url=os.environ["OPENLINKER_URL"],
+        agent_id=os.environ["OPENLINKER_AGENT_ID"],
         agent_token=os.environ["OPENLINKER_AGENT_TOKEN"],
         data_dir=os.environ.get(
             "OPENLINKER_RUNTIME_DATA_DIR",
@@ -253,7 +254,9 @@ A worker is async and single-use. Events and results are encrypted and fsynced
 before upload. Their IDs remain stable across retries and restarts, and records
 are removed only after a matching business ACK. The file store keeps a stable
 worker identity while rotating the Session identity for each process start.
-The SDK also generates the Node private key in `data_dir`, enrolls it with the
+For token-only security, omitting `node_id` derives the same stable
+token-scoped Node ID as the Go and TypeScript SDKs. When discovery requires
+mTLS, the SDK generates the Node private key in `data_dir`, enrolls it with the
 Agent Token, and renews its 24-hour client certificate automatically. Explicit
 `RuntimeMTLS` file paths are only needed for external-PKI compatibility.
 

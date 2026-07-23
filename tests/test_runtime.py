@@ -67,6 +67,25 @@ def assignment(store: runtime.MemoryRuntimeStore) -> runtime.RuntimeAssignment:
     )
 
 
+def test_runtime_error_classifier_is_explicit_and_forward_compatible():
+    assert runtime_worker_module._fatal_error(
+        runtime.RuntimeRemoteError("UNAUTHORIZED", "revoked", status_code=401)
+    )
+    assert runtime_worker_module._fatal_error(
+        ConnectionClosedError(Close(4401, "AUTHENTICATION_FAILED"), None)
+    )
+    assert not runtime_worker_module._fatal_error(
+        runtime.RuntimeRemoteError(
+            "AUTH_BACKEND_BUSY",
+            "temporary authentication backend failure",
+            status_code=401,
+        )
+    )
+    assert not runtime_worker_module._fatal_error(
+        ConnectionClosedError(Close(4499, "AUTH_BACKEND_BUSY"), None)
+    )
+
+
 class FakeTransport:
     def __init__(self, *, kind: str = "pull") -> None:
         self.kind = kind
@@ -388,7 +407,9 @@ async def test_worker_token_only_mode_skips_runtime_credentials(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_worker_token_only_mode_requires_configured_identity(monkeypatch):
+async def test_worker_token_only_mode_derives_node_identity(monkeypatch):
+    captured: dict[str, Any] = {}
+
     async def discover(_platform_url):
         return RuntimeDiscoveryConnection(
             "https://runtime.example.test",
@@ -397,8 +418,14 @@ async def test_worker_token_only_mode_requires_configured_identity(monkeypatch):
         )
 
     monkeypatch.setattr(runtime_worker_module, "discover_runtime_connection", discover)
+    monkeypatch.setattr(
+        runtime_worker_module,
+        "HTTPRuntimeTransport",
+        lambda *_args, **kwargs: captured.update(kwargs) or FakeTransport(),
+    )
     worker = runtime.RuntimeWorker(
         platform_url="https://platform.example.test",
+        agent_id=AGENT_ID,
         agent_token="ol_agent_token_only",
         store=runtime.MemoryRuntimeStore(),
         allow_unsafe_memory_store=True,
@@ -406,8 +433,12 @@ async def test_worker_token_only_mode_requires_configured_identity(monkeypatch):
         transport="pull",
     )
 
-    with pytest.raises(ValueError, match="required for token-only"):
-        await worker._setup_transport()
+    await worker._setup_transport()
+    assert worker.node_id == runtime_worker_module._token_scoped_runtime_node_id(
+        "ol_agent_token_only"
+    )
+    assert worker.node_id == "d6bb911d-7ad6-528b-9a8e-34e2785975fd"
+    assert captured["node_id"] == worker.node_id
 
 
 @pytest.mark.asyncio
