@@ -48,6 +48,7 @@ from .transport import (
 from .types import (
     RUNTIME_MAX_CAPACITY,
     RuntimeAttemptIdentity,
+    RuntimeAuthority,
     RuntimeDrainTimeoutError,
     RuntimeEvent,
     RuntimeHandlerError,
@@ -98,6 +99,10 @@ class _RuntimeStoppedBeforeDrain(RuntimeError):
         super().__init__("RuntimeWorker stopped before its durable drain completed")
 
 
+class _RuntimeAssignmentAuthorityError(ValueError):
+    pass
+
+
 class RuntimeHandler(Protocol):
     async def handle(self, context: RuntimeContext) -> RuntimeResult | dict[str, Any] | Any: ...
 
@@ -128,7 +133,12 @@ class RuntimeContext:
         self.run_id = attempt.run_id
         self.agent_id = attempt.agent_id
         self.input = dict(active.assignment.input)
-        self.metadata = dict(active.assignment.metadata)
+        self.metadata, self.authority = _runtime_authority_from_metadata(
+            active.assignment.metadata,
+            active.assignment.identity.session_epoch,
+            attempt.runtime_session_id,
+            worker._ready,
+        )
 
     @property
     def cancelled(self) -> bool:
@@ -924,8 +934,9 @@ class RuntimeWorker:
 
     async def _execute_attempt(self, active: _ActiveAttempt) -> None:
         started = time.monotonic()
-        context = RuntimeContext(self, active)
+        context: RuntimeContext | None = None
         try:
+            context = RuntimeContext(self, active)
             raw = await _invoke_handler(self.handler, context)
             context._close()
             result = _normalize_result(raw)
@@ -937,12 +948,18 @@ class RuntimeWorker:
             result = RuntimeResult.failed(
                 "HANDLER_CANCELLED", "handler stopped without a Runtime cancellation"
             )
+        except _RuntimeAssignmentAuthorityError:
+            result = RuntimeResult.failed(
+                "ASSIGNMENT_AUTHORITY_INVALID",
+                "assignment Runtime authority is invalid",
+            )
         except Exception as exc:
             result = RuntimeResult.failed(
                 "HANDLER_ERROR", _bounded(str(exc), 500, "handler failed")
             )
         finally:
-            context._close()
+            if context is not None:
+                context._close()
         if active.cancel_event.is_set() or self._force_cancel.is_set():
             return
         duration_ms = result.duration_ms or max(0, int((time.monotonic() - started) * 1000))
@@ -2622,6 +2639,59 @@ def _canonical_uuid(value: str, label: str) -> None:
         raise ValueError(f"{label} must be a UUID") from exc
     if parsed.int == 0 or str(parsed) != value:
         raise ValueError(f"{label} must be a lowercase non-zero UUID")
+
+
+_RUNTIME_AUTHORITY_METADATA_KEY = "_openlinker_runtime_authority"
+
+
+def _runtime_authority_from_metadata(
+    raw_metadata: dict[str, Any],
+    session_epoch: int,
+    runtime_session_id: str,
+    ready: RuntimeReady | None,
+) -> tuple[dict[str, Any], RuntimeAuthority | None]:
+    metadata = dict(raw_metadata)
+    missing = object()
+    raw = metadata.pop(_RUNTIME_AUTHORITY_METADATA_KEY, missing)
+    if raw is missing:
+        return metadata, None
+    if (
+        ready is None
+        or not isinstance(raw, dict)
+        or set(raw) != {"principal_scope_id", "source"}
+        or raw.get("source") != "core"
+        or not isinstance(raw.get("principal_scope_id"), str)
+        or session_epoch < 1
+    ):
+        raise _RuntimeAssignmentAuthorityError(
+            "assignment Runtime authority is invalid"
+        )
+    principal_scope_id = raw["principal_scope_id"]
+    try:
+        _canonical_runtime_principal_scope(principal_scope_id)
+        _canonical_uuid(runtime_session_id, "runtime_session_id")
+        _canonical_uuid(ready.attachment_id, "runtime_attachment_id")
+    except ValueError as exc:
+        raise _RuntimeAssignmentAuthorityError(
+            "assignment Runtime authority is invalid"
+        ) from exc
+    return metadata, RuntimeAuthority(
+        principal_scope_id=principal_scope_id,
+        runtime_session_id=runtime_session_id,
+        runtime_session_epoch=session_epoch,
+        runtime_attachment_id=ready.attachment_id,
+    )
+
+
+def _canonical_runtime_principal_scope(value: str) -> None:
+    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+    if (
+        not value
+        or len(value) > 256
+        or value.strip() != value
+        or any(character not in allowed for character in value)
+    ):
+        raise ValueError("principal_scope_id must be an opaque Runtime identifier")
 
 
 def _token_scoped_runtime_node_id(agent_token: str) -> str:
