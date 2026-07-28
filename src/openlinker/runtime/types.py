@@ -115,6 +115,14 @@ class RuntimeMTLS:
 
 
 @dataclass(frozen=True)
+class RuntimeAuthority:
+    principal_scope_id: str
+    runtime_session_id: str
+    runtime_session_epoch: int
+    runtime_attachment_id: str
+
+
+@dataclass(frozen=True)
 class RuntimeAttemptIdentity:
     run_id: str
     attempt_id: str

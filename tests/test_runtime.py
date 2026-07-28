@@ -446,10 +446,25 @@ async def test_assignment_is_durable_and_confirmed_before_handler_runs():
     store = runtime.MemoryRuntimeStore()
     transport = FakeTransport()
     transport.assignment = assignment(store)
+    transport.assignment.metadata.update(
+        {
+            "_openlinker_runtime_authority": {
+                "principal_scope_id": "ps1_" + ("A" * 43),
+                "source": "core",
+            }
+        }
+    )
     transport.ack_release.clear()
     handler_started = asyncio.Event()
 
     async def handler(context: runtime.RuntimeContext) -> dict[str, Any]:
+        assert context.metadata == {"source": "test"}
+        assert context.authority == runtime.RuntimeAuthority(
+            principal_scope_id="ps1_" + ("A" * 43),
+            runtime_session_id=store.identity.runtime_session_id,
+            runtime_session_epoch=store.identity.session_epoch,
+            runtime_attachment_id=ATTACHMENT_ID,
+        )
         handler_started.set()
         await context.emit("run.progress", {"step": 1})
         return {"answer": "ok"}
@@ -467,6 +482,42 @@ async def test_assignment_is_durable_and_confirmed_before_handler_runs():
         await worker.stop()
         await running
     assert transport.session_closed
+
+
+@pytest.mark.asyncio
+async def test_malformed_runtime_authority_is_rejected_before_handler():
+    store = runtime.MemoryRuntimeStore()
+    transport = FakeTransport()
+    transport.assignment = assignment(store)
+    transport.assignment.metadata.update(
+        {
+                "_openlinker_runtime_authority": {
+                    "principal_scope_id": "not/an/opaque-id",
+                "source": "core",
+            }
+        }
+    )
+    handler_calls = 0
+
+    async def handler(_context: runtime.RuntimeContext) -> dict[str, Any]:
+        nonlocal handler_calls
+        handler_calls += 1
+        return {}
+
+    worker = make_worker(store, transport, handler)
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(transport.result_acked.wait(), timeout=1)
+        assert handler_calls == 0
+        assert transport.result_attempts[0]["status"] == "failed"
+        assert transport.result_attempts[0]["error"] == {
+            "error_code": "ASSIGNMENT_AUTHORITY_INVALID",
+            "message": "assignment Runtime authority is invalid",
+            "retryable_hint": False,
+        }
+    finally:
+        await worker.stop()
+        await running
 
 
 @pytest.mark.asyncio
