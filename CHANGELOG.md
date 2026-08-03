@@ -4,6 +4,9 @@
 
 This is a pre-1.0 breaking Runtime cutover.
 
+- Added Browser interaction policy, policy generation, canonical mutation
+  origins, origin digest, and Browser contract evidence to `RunResponse` and
+  the public Core client contract fixture.
 - Added the async, single-use `RuntimeWorker` with direct Python handler execution.
 - Added credential-free Runtime discovery, mTLS, Session attachment generations,
   WebSocket/long-poll recovery, lease renewal, resume, cancellation and drain.

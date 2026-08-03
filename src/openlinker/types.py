@@ -206,6 +206,11 @@ class RunResponse(Model):
     runtime_transport: str | None = None
     runtime_transport_reason: str | None = None
     runtime_transport_changed_at: str | None = None
+    browser_interaction_policy: str | None = None
+    browser_interaction_policy_generation: int | None = None
+    browser_mutation_origins: list[str] = jfield(default_factory=list)
+    browser_mutation_origins_sha256: str | None = None
+    browser_contract_id: str | None = None
     dispatch_state: str = ""
     attempt_count: int = 0
     max_attempts: int = 0

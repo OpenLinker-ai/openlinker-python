@@ -71,6 +71,11 @@ async def test_run_agent_encodes_request_body():
                 "runtime_transport": "long_poll",
                 "runtime_transport_reason": "websocket_unavailable",
                 "runtime_transport_changed_at": "2026-07-18T00:00:00Z",
+                "browser_interaction_policy": "full",
+                "browser_interaction_policy_generation": 7,
+                "browser_mutation_origins": ["https://example.com"],
+                "browser_mutation_origins_sha256": "a" * 64,
+                "browser_contract_id": "openlinker.browser.v2",
                 "dispatch_state": "terminal",
                 "attempt_count": 1,
                 "max_attempts": 3,
@@ -99,6 +104,10 @@ async def test_run_agent_encodes_request_body():
     assert resp.agent_connection_mode == "runtime"
     assert resp.runtime_transport == "long_poll"
     assert resp.runtime_transport_reason == "websocket_unavailable"
+    assert resp.browser_interaction_policy == "full"
+    assert resp.browser_interaction_policy_generation == 7
+    assert resp.browser_mutation_origins == ["https://example.com"]
+    assert resp.browser_contract_id == "openlinker.browser.v2"
     assert resp.dispatch_state == "terminal"
     assert resp.attempt_count == 1
     assert seen["path"] == "/api/v1/run"
