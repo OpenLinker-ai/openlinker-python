@@ -120,6 +120,11 @@ class RuntimeAuthority:
     runtime_session_id: str
     runtime_session_epoch: int
     runtime_attachment_id: str
+    execution_profile: str = ""
+    browser_interaction_policy: str = ""
+    browser_interaction_policy_generation: int = 0
+    browser_mutation_origins: tuple[str, ...] = ()
+    browser_mutation_origins_sha256: str = ""
 
 
 @dataclass(frozen=True)
