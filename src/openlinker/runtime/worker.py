@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import inspect
+import json
 import logging
 import random
 import time
@@ -13,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from websockets.exceptions import ConnectionClosed
 
@@ -2642,6 +2645,15 @@ def _canonical_uuid(value: str, label: str) -> None:
 
 
 _RUNTIME_AUTHORITY_METADATA_KEY = "_openlinker_runtime_authority"
+_RUNTIME_AUTHORITY_KEYS = {
+    "principal_scope_id",
+    "source",
+    "execution_profile",
+    "browser_interaction_policy",
+    "browser_interaction_policy_generation",
+    "browser_mutation_origins",
+    "browser_mutation_origins_sha256",
+}
 
 
 def _runtime_authority_from_metadata(
@@ -2658,7 +2670,7 @@ def _runtime_authority_from_metadata(
     if (
         ready is None
         or not isinstance(raw, dict)
-        or set(raw) != {"principal_scope_id", "source"}
+        or not set(raw).issubset(_RUNTIME_AUTHORITY_KEYS)
         or raw.get("source") != "core"
         or not isinstance(raw.get("principal_scope_id"), str)
         or session_epoch < 1
@@ -2671,6 +2683,7 @@ def _runtime_authority_from_metadata(
         _canonical_runtime_principal_scope(principal_scope_id)
         _canonical_uuid(runtime_session_id, "runtime_session_id")
         _canonical_uuid(ready.attachment_id, "runtime_attachment_id")
+        authority = _validated_runtime_authority_fields(raw)
     except ValueError as exc:
         raise _RuntimeAssignmentAuthorityError(
             "assignment Runtime authority is invalid"
@@ -2680,7 +2693,118 @@ def _runtime_authority_from_metadata(
         runtime_session_id=runtime_session_id,
         runtime_session_epoch=session_epoch,
         runtime_attachment_id=ready.attachment_id,
+        **authority,
     )
+
+
+def _validated_runtime_authority_fields(raw: dict[str, Any]) -> dict[str, Any]:
+    execution_profile = raw.get("execution_profile", "")
+    policy = raw.get("browser_interaction_policy", "")
+    generation = raw.get("browser_interaction_policy_generation", 0)
+    origins = raw.get("browser_mutation_origins")
+    digest = raw.get("browser_mutation_origins_sha256", "")
+    if execution_profile in {"", "standard"}:
+        if any(
+            key in raw
+            for key in (
+                "browser_interaction_policy",
+                "browser_interaction_policy_generation",
+                "browser_mutation_origins",
+                "browser_mutation_origins_sha256",
+            )
+        ):
+            raise ValueError("standard Runtime authority contains Browser fields")
+        return {
+            "execution_profile": execution_profile,
+            "browser_interaction_policy": "",
+            "browser_interaction_policy_generation": 0,
+            "browser_mutation_origins": (),
+            "browser_mutation_origins_sha256": "",
+        }
+    if (
+        execution_profile != "browser"
+        or policy not in {"restricted", "full"}
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 1
+        or not isinstance(origins, list)
+        or len(origins) > 32
+        or any(not isinstance(origin, str) for origin in origins)
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError("Browser Runtime authority is invalid")
+    canonical = sorted(_canonical_runtime_browser_mutation_origin(origin) for origin in origins)
+    if (
+        canonical != origins
+        or len(set(canonical)) != len(canonical)
+        or (policy == "restricted" and canonical)
+        or (policy == "full" and not canonical)
+        or hashlib.sha256(
+            json.dumps(canonical, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        != digest
+    ):
+        raise ValueError("Browser Runtime authority is not canonical")
+    return {
+        "execution_profile": execution_profile,
+        "browser_interaction_policy": policy,
+        "browser_interaction_policy_generation": generation,
+        "browser_mutation_origins": tuple(canonical),
+        "browser_mutation_origins_sha256": digest,
+    }
+
+
+def _canonical_runtime_browser_mutation_origin(raw: str) -> str:
+    if not raw or raw.strip() != raw or "%" in raw:
+        raise ValueError("Browser mutation origin is invalid")
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Browser mutation origin is invalid") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or not host
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or host.endswith(".")
+    ):
+        raise ValueError("Browser mutation origin is invalid")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            canonical_host = host.lower().encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ValueError("Browser mutation origin host is invalid") from exc
+        if len(canonical_host) > 253:
+            raise ValueError("Browser mutation origin host is invalid")
+        labels = canonical_host.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-" for character in label)
+            for label in labels
+        ):
+            raise ValueError("Browser mutation origin host is invalid")
+    else:
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            raise ValueError("IPv4-mapped IPv6 Browser origins are invalid")
+        canonical_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    if port == 443:
+        port = None
+    canonical = f"https://{canonical_host}{f':{port}' if port else ''}"
+    if raw != canonical:
+        raise ValueError("Browser mutation origin must already be canonical")
+    return canonical
 
 
 def _canonical_runtime_principal_scope(value: str) -> None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -451,6 +453,7 @@ async def test_assignment_is_durable_and_confirmed_before_handler_runs():
             "_openlinker_runtime_authority": {
                 "principal_scope_id": "ps1_" + ("A" * 43),
                 "source": "core",
+                "execution_profile": "standard",
             }
         }
     )
@@ -464,6 +467,7 @@ async def test_assignment_is_durable_and_confirmed_before_handler_runs():
             runtime_session_id=store.identity.runtime_session_id,
             runtime_session_epoch=store.identity.session_epoch,
             runtime_attachment_id=ATTACHMENT_ID,
+            execution_profile="standard",
         )
         handler_started.set()
         await context.emit("run.progress", {"step": 1})
@@ -484,6 +488,42 @@ async def test_assignment_is_durable_and_confirmed_before_handler_runs():
     assert transport.session_closed
 
 
+def test_browser_runtime_authority_is_validated_and_exposed():
+    origins = ["https://github.com", "https://openlinker.ai"]
+    digest = hashlib.sha256(
+        json.dumps(origins, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    metadata, authority = runtime_worker_module._runtime_authority_from_metadata(
+        {
+            "keep": "ordinary",
+            "_openlinker_runtime_authority": {
+                "principal_scope_id": "ps1_" + ("A" * 43),
+                "source": "core",
+                "execution_profile": "browser",
+                "browser_interaction_policy": "full",
+                "browser_interaction_policy_generation": 7,
+                "browser_mutation_origins": origins,
+                "browser_mutation_origins_sha256": digest,
+            },
+        },
+        3,
+        "99999999-9999-4999-8999-999999999999",
+        ready(),
+    )
+    assert metadata == {"keep": "ordinary"}
+    assert authority == runtime.RuntimeAuthority(
+        principal_scope_id="ps1_" + ("A" * 43),
+        runtime_session_id="99999999-9999-4999-8999-999999999999",
+        runtime_session_epoch=3,
+        runtime_attachment_id=ATTACHMENT_ID,
+        execution_profile="browser",
+        browser_interaction_policy="full",
+        browser_interaction_policy_generation=7,
+        browser_mutation_origins=tuple(origins),
+        browser_mutation_origins_sha256=digest,
+    )
+
+
 @pytest.mark.asyncio
 async def test_malformed_runtime_authority_is_rejected_before_handler():
     store = runtime.MemoryRuntimeStore()
@@ -491,10 +531,15 @@ async def test_malformed_runtime_authority_is_rejected_before_handler():
     transport.assignment = assignment(store)
     transport.assignment.metadata.update(
         {
-                "_openlinker_runtime_authority": {
-                    "principal_scope_id": "not/an/opaque-id",
+            "_openlinker_runtime_authority": {
+                "principal_scope_id": "ps1_" + ("A" * 43),
                 "source": "core",
-            }
+                "execution_profile": "browser",
+                "browser_interaction_policy": "full",
+                "browser_interaction_policy_generation": 1,
+                "browser_mutation_origins": ["https://github.com"],
+                "browser_mutation_origins_sha256": "0" * 64,
+            },
         }
     )
     handler_calls = 0

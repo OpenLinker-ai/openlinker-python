@@ -4,6 +4,9 @@
 
 This is a pre-1.0 breaking Runtime cutover.
 
+- Runtime Workers now accept and strictly validate Core-owned standard and
+  Browser authority envelopes, expose Browser interaction policy and canonical
+  mutation-origin evidence to handlers, and reject tampered authority fields.
 - Added Browser interaction policy, policy generation, canonical mutation
   origins, origin digest, and Browser contract evidence to `RunResponse` and
   the public Core client contract fixture.
