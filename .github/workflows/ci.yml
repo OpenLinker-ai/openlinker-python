@@ -55,4 +55,47 @@ jobs:
         run: python -m pytest
 
       - name: Build distributions
-        run: python -m build
+        if: matrix.python-version == '3.12'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m build
+          for artifact in dist/*; do
+            sha256sum "${artifact}" > "${artifact}.sha256"
+          done
+
+      - name: Upload packaged distributions
+        if: github.ref_type == 'tag' && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v7
+        with:
+          name: openlinker-python-distributions
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    name: Publish GitHub release distributions
+    if: github.ref_type == 'tag'
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: openlinker-python-distributions
+          path: dist
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create "${tag}" --title "${tag}" --generate-notes
+          fi
+          gh release upload "${tag}" dist/* --clobber
