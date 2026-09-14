@@ -1,5 +1,7 @@
 from .store import FileRuntimeStore, MemoryRuntimeStore, RuntimeStore
 from .types import (
+    RUNTIME_DELEGATED_RUN_READ_FEATURE,
+    RuntimeDelegationUnsupportedError,
     RUNTIME_CONTRACT_DIGEST,
     RUNTIME_CONTRACT_ID,
     RUNTIME_PROTOCOL_VERSION,
@@ -26,6 +28,8 @@ from .types import (
 from .worker import RuntimeContext, RuntimeHandler, RuntimeHandlerCallable, RuntimeWorker
 
 __all__ = [
+    "RUNTIME_DELEGATED_RUN_READ_FEATURE",
+    "RuntimeDelegationUnsupportedError",
     "RUNTIME_CONTRACT_DIGEST",
     "RUNTIME_CONTRACT_ID",
     "RUNTIME_PROTOCOL_VERSION",

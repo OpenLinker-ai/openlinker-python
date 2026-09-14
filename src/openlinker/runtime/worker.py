@@ -49,6 +49,11 @@ from .transport import (
     validate_runtime_origin,
 )
 from .types import (
+    RuntimeDelegationUnsupportedError,
+    runtime_delegation_read_advertised,
+    validate_delegated_run,
+    validate_runtime_run_summary as _validate_run_summary,
+    normalize_runtime_optional_features,
     RUNTIME_MAX_CAPACITY,
     RuntimeAttemptIdentity,
     RuntimeAuthority,
@@ -203,6 +208,45 @@ class RuntimeContext:
             closed.cancel()
             await asyncio.gather(cancelled, closed, return_exceptions=True)
 
+    @property
+    def can_read_delegated_runs(self) -> bool:
+        return runtime_delegation_read_advertised(
+            self._active.assignment.agent_invocation_token
+        ) and callable(getattr(self._worker._transport, "read_delegated_run", None))
+
+    async def read_delegated_run(self, run_id: str) -> dict[str, Any]:
+        _canonical_uuid(run_id, "delegated run_id")
+        if self._closed.is_set() or self.cancelled or self._worker._force_cancel.is_set():
+            raise asyncio.CancelledError
+        if not self.can_read_delegated_runs:
+            raise RuntimeDelegationUnsupportedError()
+
+        async def read() -> dict[str, Any]:
+            method = getattr(self._worker._transport_required(), "read_delegated_run", None)
+            if not callable(method):
+                raise RuntimeDelegationUnsupportedError()
+            return await method(
+                run_id, node_envelope=self._active.assignment.node_envelope,
+                invocation_token=self._active.assignment.agent_invocation_token,
+                idempotency_key="read-delegated-" + run_id,
+            )
+
+        # Match Go/JS delegated reads: only explicit transport-policy recovery
+        # may replay a read. Ordinary errors belong to the caller, including a
+        # NOT_FOUND response for a Run outside this Attempt's direct children.
+        call = asyncio.create_task(self._worker._policy_operation(read))
+        cancelled = asyncio.create_task(self._active.cancel_event.wait())
+        closed = asyncio.create_task(self._closed.wait())
+        try:
+            done, _ = await asyncio.wait({call, cancelled, closed}, return_when=asyncio.FIRST_COMPLETED)
+            if cancelled in done or closed in done:
+                raise asyncio.CancelledError
+            return validate_delegated_run(await call, run_id)
+        finally:
+            for task in (call, cancelled, closed):
+                task.cancel()
+            await asyncio.gather(call, cancelled, closed, return_exceptions=True)
+
     def _close(self) -> None:
         self._closed.set()
 
@@ -229,6 +273,7 @@ class RuntimeWorker:
         transport: str = "auto",
         node_version: str = DEFAULT_NODE_VERSION,
         capacity: int = DEFAULT_CAPACITY,
+        optional_features: tuple[str, ...] | list[str] = (),
         claim_wait: float = DEFAULT_CLAIM_WAIT,
         command_wait: float = DEFAULT_COMMAND_WAIT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
@@ -256,6 +301,7 @@ class RuntimeWorker:
         self._configured_transport_mode = self.transport_mode
         self.node_version = node_version.strip() or DEFAULT_NODE_VERSION
         self.capacity = capacity
+        self.optional_features = normalize_runtime_optional_features(optional_features)
         self.claim_wait = claim_wait
         self.command_wait = command_wait
         self.heartbeat_interval = heartbeat_interval
@@ -1879,6 +1925,7 @@ class RuntimeWorker:
             session_epoch=identity.session_epoch,
             node_version=self.node_version,
             capacity=effective_capacity if capacity is None else capacity,
+            optional_features=self.optional_features,
         )
 
     def _capacity_snapshot(self) -> tuple[int, int]:
@@ -2614,25 +2661,6 @@ def _protocol_object(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeProtocolError(f"{label} must be a JSON object")
     return dict(value)
-
-
-def _validate_run_summary(value: Any) -> dict[str, Any]:
-    summary = _protocol_object(value, "delegated Agent response")
-    if set(summary) != {"run_id", "status", "dispatch_state"}:
-        raise RuntimeProtocolError("delegated Agent response fields do not match the contract")
-    _canonical_uuid(str(summary["run_id"]), "delegated run_id")
-    status = summary["status"]
-    dispatch = summary["dispatch_state"]
-    allowed = {
-        "running": {"pending", "offered", "executing", "retry_wait"},
-        "success": {"terminal"},
-        "failed": {"terminal", "dead_letter"},
-        "timeout": {"terminal"},
-        "canceled": {"terminal"},
-    }
-    if status not in allowed or dispatch not in allowed[status]:
-        raise RuntimeProtocolError("delegated Agent response has inconsistent state")
-    return summary
 
 
 def _canonical_uuid(value: str, label: str) -> None:

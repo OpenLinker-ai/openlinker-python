@@ -31,6 +31,8 @@ RUNTIME_MAX_PULL_WAIT_SECONDS = 30
 RUNTIME_MAX_CAPACITY = 1024
 RUNTIME_WEBSOCKET_PATH = "/api/v1/agent-runtime/ws"
 RUNTIME_CALL_AGENT_PATH = "/api/v1/agent-runtime/call-agent"
+RUNTIME_DELEGATED_RUN_READ_PATH = "/api/v1/agent-runtime/delegated-runs/read"
+RUNTIME_DELEGATED_RUN_READ_FEATURE = "delegated_run_read.v1"
 
 RuntimeTransportMode = Literal["auto", "ws", "pull"]
 
@@ -42,6 +44,13 @@ _DETERMINISTIC_DOMAIN = "openlinker/runtime/deterministic-id"
 
 class RuntimeProtocolError(RuntimeError):
     """The peer returned a response that cannot be trusted."""
+
+
+class RuntimeDelegationUnsupportedError(RuntimeError):
+    code = "RUNTIME_DELEGATION_UNSUPPORTED"
+
+    def __init__(self) -> None:
+        super().__init__("Core/SDK did not negotiate delegated Run results")
 
 
 class RuntimeRemoteError(RuntimeError):
@@ -354,6 +363,7 @@ def runtime_hello(
     session_epoch: int,
     node_version: str,
     capacity: int,
+    optional_features: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     return {
         "node_id": node_id,
@@ -363,9 +373,22 @@ def runtime_hello(
         "session_epoch": session_epoch,
         "node_version": node_version,
         "capacity": capacity,
-        "features": list(RUNTIME_REQUIRED_FEATURES),
+        "features": [*RUNTIME_REQUIRED_FEATURES, *normalize_runtime_optional_features(optional_features)],
         "contract_digest": RUNTIME_CONTRACT_DIGEST,
     }
+
+
+def normalize_runtime_optional_features(features: Any) -> tuple[str, ...]:
+    if not isinstance(features, (list, tuple)):
+        raise ValueError("Runtime optional features must be a sequence")
+    seen = set(RUNTIME_REQUIRED_FEATURES)
+    for feature in features:
+        if not isinstance(feature, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,99}", feature):
+            raise ValueError("Runtime optional feature is invalid")
+        if feature in seen:
+            raise ValueError("Runtime optional features must be unique and distinct from required features")
+        seen.add(feature)
+    return tuple(sorted(features))
 
 
 def wire_value(value: Any) -> Any:
@@ -398,16 +421,19 @@ def build_invocation_proof(
     body: bytes,
     context: str,
     idempotency_key: str,
+    path: str = RUNTIME_CALL_AGENT_PATH,
 ) -> str:
     _require_capability(token, "ol_inv_v2.")
     _require_capability(context, "ol_ctx_v2.")
     validate_idempotency_key(idempotency_key)
+    if not isinstance(path, str) or not path.startswith("/") or path != path.strip():
+        raise ValueError("invocation proof path must be an absolute path")
     canonical = {
         "body_sha256": hashlib.sha256(body).hexdigest(),
         "context": context,
         "idempotency_key": idempotency_key,
         "method": "POST",
-        "path": RUNTIME_CALL_AGENT_PATH,
+        "path": path,
         "version": _PROOF_DOMAIN,
     }
     canonical_bytes = json.dumps(
@@ -419,6 +445,51 @@ def build_invocation_proof(
     key = hashlib.sha256((_PROOF_DOMAIN + "\x00" + token).encode()).digest()
     digest = hmac.new(key, canonical_bytes, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def runtime_delegation_read_advertised(token: str) -> bool:
+    """Feature detection only; Core validates signatures and live Attempt/child ownership."""
+    try:
+        _require_capability(token, "ol_inv_v2.")
+        payload = token.split(".")[2]
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", payload):
+            return False
+        claim = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return isinstance(claim, dict) and claim.get("audience") == "openlinker.runtime.v2/delegation"
+    except (ValueError, TypeError, AttributeError, RuntimeProtocolError):
+        return False
+
+
+def validate_runtime_run_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"run_id", "status", "dispatch_state"}:
+        raise RuntimeProtocolError("delegated Agent response fields do not match the contract")
+    _require_uuid(value["run_id"], "delegated run_id")
+    allowed = {
+        "running": {"pending", "offered", "executing", "retry_wait"},
+        "success": {"terminal"}, "failed": {"terminal", "dead_letter"},
+        "timeout": {"terminal"}, "canceled": {"terminal"},
+    }
+    status, dispatch = value["status"], value["dispatch_state"]
+    if not isinstance(status, str) or not isinstance(dispatch, str) or dispatch not in allowed.get(status, set()):
+        raise RuntimeProtocolError("delegated Agent response has inconsistent state")
+    return dict(value)
+
+
+def validate_delegated_run(value: Any, run_id: str) -> dict[str, Any]:
+    required = {"run_id", "status", "dispatch_state"}
+    if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(
+        required | {"output", "error_code", "error_message"}
+    ):
+        raise RuntimeProtocolError("delegated Run response fields do not match the contract")
+    validate_runtime_run_summary({key: value[key] for key in required})
+    if value["run_id"] != run_id:
+        raise RuntimeProtocolError("delegated Run ID mismatch")
+    if "output" in value and not isinstance(value["output"], dict):
+        raise RuntimeProtocolError("delegated Run output must be a JSON object")
+    for key in ("error_code", "error_message"):
+        if key in value and not isinstance(value[key], str):
+            raise RuntimeProtocolError(f"delegated Run {key} must be a string")
+    return dict(value)
 
 
 def validate_idempotency_key(value: str) -> None:

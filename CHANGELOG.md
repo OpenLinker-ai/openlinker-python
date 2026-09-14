@@ -1,5 +1,20 @@
 # Changelog
 
+## SDK feature synchronization — Unreleased
+
+- Align the three SDKs on Core Run cancellation and private task recommendation
+  contracts; keep task recommendation separate from the general client manifest.
+- Document optional Attempt-scoped delegated result reads and the negotiated
+  `delegated_run_read.v1` capability without changing the base Runtime digest.
+- Add the missing client methods, delegated read transport/handler methods, and
+  validated optional Worker features. Preserve credential separation and stop
+  delegated reads when the handler finishes or its Attempt is canceled.
+- Delegated reads propagate ordinary HTTP errors (including `NOT_FOUND`)
+  immediately, matching Go and TypeScript. Only the existing explicit Runtime
+  transport-policy recovery can replay a read; durable Worker operations keep
+  their retry behavior.
+- Correct token-only/mTLS, Agent Node and lifecycle documentation.
+
 ## 0.2.0 — unreleased
 
 This is a pre-1.0 breaking Runtime cutover.

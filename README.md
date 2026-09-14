@@ -3,7 +3,7 @@
 `openlinker-python` is the official async Python SDK for OpenLinker Core. Use the
 platform `Client` to discover and manage Agents, start runs, stream events,
 verify webhooks, and call A2A. Use `RuntimeWorker` to run a Python Agent handler
-with durable delivery over the dedicated mTLS Runtime origin.
+with durable delivery over the discovered Runtime origin and its token-only or mTLS policy.
 
 Chinese documentation: [README.zh-CN.md](./README.zh-CN.md)
 
@@ -23,7 +23,7 @@ The package has two separate credential paths:
 - `openlinker.client` is the application-side async client. It accepts a User
   Token and calls the public Core API.
 - `openlinker.runtime` hosts an Agent handler. It accepts an Agent Token and
-  connects to the dedicated Runtime origin with mutual TLS.
+  connects to the dedicated Runtime origin using its discovered token-only or mTLS policy.
 
 Runtime credentials never pass through the platform client. The SDK covers the
 open-source Core contract; Hosted service listings, orders, wallets, billing,
@@ -35,14 +35,14 @@ flowchart LR
   Client -->|"User Token / REST / SSE / A2A"| Core["openlinker-core"]
 
   Handler["Python Agent handler"] --> Worker["openlinker.runtime.RuntimeWorker"]
-  Worker -->|"Agent Token + mTLS<br/>WebSocket or long polling"| Core
+  Worker -->|"Agent Token + discovered TLS policy<br/>WebSocket or long polling"| Core
 
-  Adapter["openlinker-agent-node<br/>optional temporary Adapter"] --> GoWorker["openlinker-go Runtime Worker"]
+  Adapter["openlinker-agent-node<br/>optional bridge adapter"] --> GoWorker["openlinker-go Runtime Worker"]
   GoWorker --> Core
 ```
 
-Agent Node is not required for Python applications. It is a temporary Adapter
-for existing HTTP, command, Codex, and A2A backends around the Go SDK worker.
+Agent Node is not required for Python applications. It bridges existing HTTP, command, Codex, Claude, and A2A backends around the Go SDK worker
+and can run persistently on the user side.
 
 ## Install from Source
 
@@ -108,7 +108,8 @@ Token with only the Core grants needed by the chosen methods.
 
 - Agent discovery and public/extended Agent Cards
 - wait-for-result and start-only Run methods
-- Run lookup, retained events, SSE streaming, children, artifacts, and messages
+- Run lookup, cancellation, retained events, SSE streaming, children, artifacts, and messages
+- private Core task creation and Agent recommendations with `recommend_task`
 - platform callbacks and signed external webhook helpers
 - creator Agent and Agent Token management
 - A2A JSON-RPC and HTTP+JSON/SSE clients
@@ -267,6 +268,30 @@ provide another durable `RuntimeStore`.
 Within a confirmed assignment, `context.call_agent(...)` uses the
 assignment-scoped invocation capability. Each delegated call requires an
 idempotency key; it does not use the long-lived Agent Token for the child call.
+
+### Delegated results and optional features
+
+Set `optional_features=[runtime.RUNTIME_DELEGATED_RUN_READ_FEATURE]` on the Worker
+to request delegated result reads. Within a confirmed handler:
+
+```python
+child = await context.call_agent(target_agent_id, {"question": "hello"}, idempotency_key="child-1")
+if context.can_read_delegated_runs:
+    result = await context.read_delegated_run(child["run_id"])
+    # A running result can be polled again while this handler remains active.
+```
+
+Reads return status, dispatch state, output, and error fields. They use only the
+current Attempt invocation capability; Core verifies its signature and direct
+child ownership. Legacy assignments and custom transports without this optional
+method raise `RuntimeDelegationUnsupportedError`. Cancellation or handler return
+closes in-flight reads. `optional_features` keeps the mandatory feature set and
+contract digest unchanged.
+
+`Client.cancel_run(run_id)` requests cancellation from Core; inspect `cancel_state`
+and the later Run status to distinguish a requested cancel from a terminal Run.
+`Client.recommend_task({"query": "research"})` creates a private Core task and
+requires `tasks:create`. It is documented separately in `contracts/core-tasks.v1.json`.
 
 ## Project Layout
 

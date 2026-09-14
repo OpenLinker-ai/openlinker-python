@@ -1,11 +1,77 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from .model import Model, jfield
 
 JSON = dict[str, Any]
+
+
+@dataclass
+class RecommendTaskRequest(Model):
+    query: str = ""
+    template_id: str | None = None
+    skill_ids: list[str] = jfield(default_factory=list)
+    mcp_tools: list[str] = jfield(default_factory=list)
+    agent_slugs: list[str] = jfield(default_factory=list)
+
+
+@dataclass
+class TaskSkillRef(Model):
+    id: str = ""
+    category: str = ""
+    name: str = ""
+    description: str | None = None
+
+
+@dataclass
+class TaskMCPToolRef(Model):
+    name: str = ""
+    description: str = ""
+
+
+@dataclass
+class TaskAgentSummary(Model):
+    id: str = ""
+    slug: str = ""
+    name: str = ""
+    description: str = ""
+    price_per_call_cents: int = 0
+    total_calls: int = 0
+    avg_rating: float | None = None
+    creator_name: str = ""
+    tags: list[str] = jfield(default_factory=list)
+
+
+@dataclass
+class TaskRecommendation(Model):
+    agent: TaskAgentSummary = jfield(default_factory=TaskAgentSummary)
+    match_score: float = 0.0
+    why: str = ""
+    matched_skills: list[TaskSkillRef] = jfield(default_factory=list)
+
+
+@dataclass
+class TaskNextAction(Model):
+    type: str = ""
+    label: str = ""
+    hint: str = ""
+    href: str = ""
+    reason_code: str | None = None
+    reason: str = ""
+
+
+@dataclass
+class RecommendTaskResponse(Model):
+    task_id: str = ""
+    visibility: str = ""
+    parsed_skills: list[str] = jfield(default_factory=list)
+    parsed_skill_refs: list[TaskSkillRef] = jfield(default_factory=list)
+    mcp_tools: list[str] = jfield(default_factory=list)
+    mcp_tool_refs: list[TaskMCPToolRef] = jfield(default_factory=list)
+    recommendations: list[TaskRecommendation] = jfield(default_factory=list)
+    next_action: Optional[TaskNextAction] = None
 
 
 @dataclass

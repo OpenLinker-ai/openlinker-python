@@ -26,7 +26,7 @@ are intentionally absent.
 Implemented:
 
 - credential-free discovery of the dedicated Runtime origin
-- Agent Token plus mTLS, TLS 1.3 minimum and redirect refusal
+- Agent Token with discovered token-only or mTLS security, TLS 1.3 for mTLS and redirect refusal
 - Session attachment generation, heartbeat and close
 - WebSocket, long-poll and automatic transport recovery
 - durable assignment-before-ACK and confirmed-before-execute ordering
@@ -38,7 +38,7 @@ Implemented:
 - stable worker identity, rotating Session identity and monotonic Session epoch
 - file permissions, single-process locking, key/ciphertext integrity and capacity gates
 
-The public Python lifecycle is only:
+The Python execution entry is:
 
 ```python
 worker = RuntimeWorker(...)
@@ -68,3 +68,14 @@ The local suite covers:
 
 Live sandbox closure and optional A2A gRPC integration remain release-environment
 checks rather than unit tests.
+
+## Optional surface (2026-09-14)
+
+Go, TypeScript and Python expose Core Run cancellation, private task recommendations,
+and optional Attempt-scoped delegated result reads. The Worker negotiates the latter
+through `optional_features`; the base Runtime digest is unchanged. `drain()` and
+`stop()` control the running Python Worker lifecycle.
+
+Go also offers `WithAgent`/`Native` facades, `RequireTokenOnly`, and an opaque
+WebSocket extension channel. Those Go APIs are not claimed as Python APIs. Python
+and Go support optional A2A gRPC; the TypeScript root remains browser-safe.

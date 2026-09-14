@@ -33,6 +33,8 @@ from ..types import (
     PlatformCallbackOptions,
     RegisterAgentViaTokenRequest,
     RegisterAgentViaTokenResponse,
+    RecommendTaskRequest,
+    RecommendTaskResponse,
     RunAgentRequest,
     RunArtifactResponse,
     RunMessageResponse,
@@ -348,6 +350,11 @@ class Client:
         suffix = "agent-card.extended.json" if extended else "agent-card.json"
         return await self._do("GET", f"/agents/{_quote(slug)}/{suffix}", out=AgentCardResponse)
 
+    async def recommend_task(self, req: RecommendTaskRequest | dict[str, Any]):
+        """Create a private Core task and resolve callable Agent recommendations."""
+        return await self._do("POST", "/tasks/recommend",
+                              body=maybe_model(req, RecommendTaskRequest), out=RecommendTaskResponse)
+
     async def run_agent(self, req: RunAgentRequest | dict[str, Any]):
         return await self._create_run("/run", req)
 
@@ -375,6 +382,9 @@ class Client:
 
     async def get_run(self, run_id: str):
         return await self._do("GET", f"/runs/{_quote(run_id)}", out=RunResponse)
+
+    async def cancel_run(self, run_id: str):
+        return await self._do("POST", f"/runs/{_quote(run_id)}/cancel", out=RunResponse)
 
     async def list_run_events(
         self, run_id: str, params: ListRunEventsParams | dict[str, Any] | None = None
@@ -555,6 +565,8 @@ class Client:
     RunAgent = run_agent
     StartAgentRun = start_agent_run
     GetRun = get_run
+    CancelRun = cancel_run
+    RecommendTask = recommend_task
     ListRunEvents = list_run_events
     ListRunChildren = list_run_children
     ListRunArtifacts = list_run_artifacts

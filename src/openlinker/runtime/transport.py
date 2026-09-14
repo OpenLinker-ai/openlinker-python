@@ -15,6 +15,10 @@ import httpx
 import websockets
 
 from .types import (
+    RUNTIME_DELEGATED_RUN_READ_PATH,
+    RuntimeDelegationUnsupportedError,
+    runtime_delegation_read_advertised,
+    validate_delegated_run,
     RUNTIME_CONTRACT_ID,
     RUNTIME_MAX_MESSAGE_BYTES,
     RUNTIME_PROTOCOL_VERSION,
@@ -531,6 +535,32 @@ class HTTPRuntimeTransport:
             use_attachment=False,
         )
 
+    async def read_delegated_run(
+        self, run_id: str, *, node_envelope: str, invocation_token: str, idempotency_key: str,
+    ) -> dict[str, Any]:
+        try:
+            parsed = uuid.UUID(run_id)
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("delegated Run ID must be a UUID") from exc
+        if parsed.int == 0 or str(parsed) != run_id:
+            raise ValueError("delegated Run ID must be a lowercase non-zero UUID")
+        if not runtime_delegation_read_advertised(invocation_token):
+            raise RuntimeDelegationUnsupportedError()
+        body = wire_json_bytes({"run_id": run_id})
+        proof = build_invocation_proof(
+            invocation_token, body=body, context=node_envelope,
+            idempotency_key=idempotency_key, path=RUNTIME_DELEGATED_RUN_READ_PATH,
+        )
+        response = await self._request(
+            "POST", RUNTIME_DELEGATED_RUN_READ_PATH, raw_body=body, token=invocation_token,
+            headers={
+                "Idempotency-Key": idempotency_key,
+                "OpenLinker-Invocation-Context": node_envelope,
+                "OpenLinker-Invocation-Proof": proof,
+            }, use_attachment=False,
+        )
+        return validate_delegated_run(response, run_id)
+
     async def close(self) -> None:
         if self._owns_client:
             await self._client.aclose()
@@ -890,6 +920,14 @@ class WebSocketRuntimeTransport:
             request,
             node_envelope=node_envelope,
             invocation_token=invocation_token,
+            idempotency_key=idempotency_key,
+        )
+
+    async def read_delegated_run(
+        self, run_id: str, *, node_envelope: str, invocation_token: str, idempotency_key: str,
+    ) -> dict[str, Any]:
+        return await self._http.read_delegated_run(
+            run_id, node_envelope=node_envelope, invocation_token=invocation_token,
             idempotency_key=idempotency_key,
         )
 
