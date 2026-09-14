@@ -28,6 +28,17 @@
     {"client_method":"list_run_children","http_method":"GET","path":"/api/v1/runs/{id}/children","auth":"access_token","required_scope":"runs:read","response_fields":["parent_run_id","items[].child_run_id","items[].caller_agent_id","items[].target_agent_id","items[].status","items[].children"]},
     {"client_method":"list_run_artifacts","http_method":"GET","path":"/api/v1/runs/{id}/artifacts","auth":"access_token","required_scope":"runs:read"},
     {"client_method":"list_run_messages","http_method":"GET","path":"/api/v1/runs/{id}/messages","auth":"access_token","required_scope":"runs:read"},
-    {"client_method":"stream_run_events","http_method":"GET","path":"/api/v1/runs/{id}/stream","auth":"access_token","required_scope":"runs:read"}
+    {"client_method":"stream_run_events","http_method":"GET","path":"/api/v1/runs/{id}/stream","auth":"access_token","required_scope":"runs:read"},
+    {
+      "client_method": "cancel_run",
+      "http_method": "POST",
+      "path": "/api/v1/runs/{id}/cancel",
+      "auth": "access_token",
+      "required_scope": "runs:cancel",
+      "success_statuses": [
+        200
+      ],
+      "source": "openlinker-core/pkg/runtime/handler.go"
+    }
   ]
 }

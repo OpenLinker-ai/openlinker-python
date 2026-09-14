@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -1227,6 +1229,193 @@ async def test_runtime_context_call_agent_requires_idempotency_and_validates_sum
     try:
         await asyncio.wait_for(delegated.wait(), timeout=1)
         await asyncio.wait_for(transport.result_acked.wait(), timeout=1)
+    finally:
+        await worker.stop()
+        await running
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["pull", "ws", "auto"])
+@pytest.mark.parametrize("negotiated", [False, True])
+async def test_delegated_run_read_reaches_handler(mode, negotiated):
+    token = "ol_inv_v2.current." + base64.urlsafe_b64encode(
+        b'{"audience":"openlinker.runtime.v2/delegation"}'
+    ).rstrip(b"=").decode() + ".signature"
+    calls = []
+
+    class ReadingTransport(FakeTransport):
+        async def read_delegated_run(self, run_id, **auth):
+            calls.append(auth)
+            assert auth["invocation_token"] == token
+            assert auth["node_envelope"] == self.assignment.node_envelope
+            assert auth["idempotency_key"] == "read-delegated-" + run_id
+            return {"run_id": run_id, "status": "success", "dispatch_state": "terminal",
+                    "output": {"answer": 42}}
+
+    store = runtime.MemoryRuntimeStore()
+    transport = ReadingTransport(kind="ws" if mode != "pull" else "pull")
+    offered = assignment(store)
+    transport.assignment = replace(offered, agent_invocation_token=token) if negotiated else offered
+    completed = asyncio.Event()
+    contexts = []
+
+    async def handler(context):
+        contexts.append(context)
+        assert context.can_read_delegated_runs == negotiated
+        if negotiated:
+            assert (await context.read_delegated_run(RUN_ID))["output"] == {"answer": 42}
+        else:
+            with pytest.raises(runtime.RuntimeDelegationUnsupportedError):
+                await context.read_delegated_run(RUN_ID)
+        completed.set()
+        return {}
+
+    worker = make_worker(store, transport, handler, mode=mode)
+    worker.optional_features = (runtime.RUNTIME_DELEGATED_RUN_READ_FEATURE,)
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(completed.wait(), timeout=1)
+        await asyncio.wait_for(transport.result_acked.wait(), timeout=1)
+        assert runtime.RUNTIME_DELEGATED_RUN_READ_FEATURE in worker._hello()["features"]
+        assert len(calls) == int(negotiated)
+        with pytest.raises(asyncio.CancelledError):
+            await contexts[0].read_delegated_run(RUN_ID)
+    finally:
+        await worker.stop()
+        await running
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish", ["return", "cancel"])
+async def test_delegated_read_stops_with_handler(finish):
+    entered, aborted = asyncio.Event(), asyncio.Event()
+
+    class ReadingTransport(FakeTransport):
+        async def read_delegated_run(self, run_id, **auth):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                aborted.set()
+
+    store = runtime.MemoryRuntimeStore()
+    transport = ReadingTransport()
+    token = "ol_inv_v2.current." + base64.urlsafe_b64encode(
+        b'{"audience":"openlinker.runtime.v2/delegation"}'
+    ).rstrip(b"=").decode() + ".signature"
+    transport.assignment = replace(assignment(store), agent_invocation_token=token)
+    reads = []
+
+    async def handler(context):
+        reads.append(asyncio.create_task(context.read_delegated_run(RUN_ID)))
+        await entered.wait()
+        if finish == "cancel":
+            await reads[0]
+        return {}
+
+    worker = make_worker(store, transport, handler)
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        if finish == "cancel":
+            await transport.commands.put({"type": "run.cancel", "payload": {
+                "cancellation_id": CANCELLATION_ID,
+                "attempt_identity": transport.assignment.attempt_identity.to_dict(),
+                "deadline_at": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat(),
+                "reason_code": "caller_requested",
+            }})
+        await asyncio.wait_for(aborted.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await reads[0]
+    finally:
+        await worker.stop()
+        await running
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,code", [
+    (400, "INVALID_ARGUMENT"), (403, "FORBIDDEN"), (404, "NOT_FOUND"),
+    (409, "CONFLICT"), (422, "UNPROCESSABLE_ENTITY"),
+    (429, "RATE_LIMITED"), (503, "DATABASE_UNAVAILABLE"),
+])
+async def test_delegated_read_propagates_remote_errors_without_attempt_deadline_retry(status, code):
+    failure = runtime.RuntimeRemoteError(code, "read refused", status_code=status, retryable=True)
+    calls = 0
+
+    class ReadingTransport(FakeTransport):
+        async def read_delegated_run(self, run_id, **auth):
+            nonlocal calls
+            calls += 1
+            raise failure
+
+    store = runtime.MemoryRuntimeStore()
+    transport = ReadingTransport()
+    token = "ol_inv_v2.current." + base64.urlsafe_b64encode(
+        b'{"audience":"openlinker.runtime.v2/delegation"}'
+    ).rstrip(b"=").decode() + ".signature"
+    transport.assignment = replace(assignment(store), agent_invocation_token=token)
+    completed = asyncio.Event()
+
+    async def handler(context):
+        with pytest.raises(runtime.RuntimeRemoteError) as raised:
+            await context.read_delegated_run(TARGET_AGENT_ID)
+        assert raised.value is failure
+        assert calls == 1
+        completed.set()
+        return {}
+
+    worker = make_worker(store, transport, handler)
+    running = asyncio.create_task(worker.run())
+    try:
+        # The offered Attempt lasts two minutes. An invalid child must return
+        # to its Handler promptly, without consuming that execution budget.
+        await asyncio.wait_for(completed.wait(), timeout=1)
+        await asyncio.wait_for(transport.result_acked.wait(), timeout=1)
+        assert calls == 1
+    finally:
+        await worker.stop()
+        await running
+
+
+@pytest.mark.asyncio
+async def test_delegated_read_retains_one_explicit_policy_recovery():
+    calls = 0
+    recoveries = []
+
+    class ReadingTransport(FakeTransport):
+        async def read_delegated_run(self, run_id, **auth):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise runtime.RuntimeRemoteError("FORBIDDEN", "RUNTIME_POLICY_CHANGED", status_code=403)
+            return {"run_id": run_id, "status": "success", "dispatch_state": "terminal"}
+
+    store = runtime.MemoryRuntimeStore()
+    transport = ReadingTransport()
+    token = "ol_inv_v2.current." + base64.urlsafe_b64encode(
+        b'{"audience":"openlinker.runtime.v2/delegation"}'
+    ).rstrip(b"=").decode() + ".signature"
+    transport.assignment = replace(assignment(store), agent_invocation_token=token)
+    completed = asyncio.Event()
+
+    async def handler(context):
+        assert (await context.read_delegated_run(RUN_ID))["status"] == "success"
+        completed.set()
+        return {}
+
+    worker = make_worker(store, transport, handler)
+
+    async def recover(revision):
+        recoveries.append(revision)
+        return ready()
+
+    worker._recover_runtime_policy = recover
+    running = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(completed.wait(), timeout=1)
+        await asyncio.wait_for(transport.result_acked.wait(), timeout=1)
+        assert calls == 2
+        assert recoveries == [0]
     finally:
         await worker.stop()
         await running

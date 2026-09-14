@@ -24,7 +24,7 @@ Client 只接受 User Token。Agent 端的 Session 和执行方法不会混入�
 已经实现：
 
 - 不带凭证发现独立 Runtime 地址；
-- Agent Token、mTLS、最低 TLS 1.3 和拒绝重定向；
+- Agent Token 与 discovery 指定的 token-only 或 mTLS；mTLS 最低 TLS 1.3，拒绝重定向；
 - Session 建立、心跳和关闭；
 - WebSocket、长轮询和自动连接恢复；
 - 先持久化任务再确认、Core 确认后才执行；
@@ -36,7 +36,7 @@ Client 只接受 User Token。Agent 端的 Session 和执行方法不会混入�
 - 稳定的 worker 身份、每次启动更新的 Session 身份和单调递增的 Session 次序；
 - 文件权限、单进程锁、密钥和密文完整性、容量上限。
 
-公开的 Python 生命周期只有：
+Python 执行入口为：
 
 ```python
 worker = RuntimeWorker(...)
@@ -65,3 +65,13 @@ heartbeat/claim/result 接口。
 
 真实沙箱闭环和可选 A2A gRPC 集成仍属于发布环境检查，单元测试不代表这些外部环境
 已经连通。
+
+## 可选能力（2026-09-14）
+
+Go、TypeScript 和 Python 均提供 Core Run 取消、私有任务推荐及当前 Attempt 内的委派
+结果读取；后者通过 Worker 的 `optional_features` 协商，基础 Runtime digest 不变。
+运行中的 Python Worker 可用 `drain()` 和 `stop()` 管理生命周期。
+
+Go 另有 `WithAgent`/`Native` 包装、`RequireTokenOnly` 和不透明 WebSocket 扩展通道，
+它们不等于 Python 公开 API。Python 和 Go 支持可选 A2A gRPC；TypeScript 根入口保持
+浏览器安全。

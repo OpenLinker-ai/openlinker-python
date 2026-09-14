@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "openlinker"
 version = "0.2.0"
-description = "Official async Python SDK for OpenLinker Core: Agent discovery and management, runs, SSE, webhooks, A2A, and a durable mTLS Runtime Worker."
+description = "Official async Python SDK for OpenLinker Core: Agent discovery and management, runs, SSE, webhooks, A2A, and a durable Runtime Worker with discovered token-only or mTLS security."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

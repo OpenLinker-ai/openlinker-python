@@ -2,7 +2,7 @@
 
 `openlinker-python` 是 OpenLinker Core 的官方异步 Python SDK。应用可以用
 `Client` 发现和管理 Agent、启动 Run、订阅事件、验证 Webhook 和调用 A2A；Python
-Agent 可以用 `RuntimeWorker` 通过专用 mTLS Runtime 入口可靠接收并执行任务。
+Agent 可以用 `RuntimeWorker` 通过 discovery 指定的 token-only 或 mTLS Runtime 入口可靠接收并执行任务。
 
 English documentation: [README.md](./README.md)
 
@@ -19,7 +19,7 @@ registry release。
 包内有两条相互分离的凭据路径：
 
 - `openlinker.client` 是应用侧异步客户端，使用 User Token 调用 Core 公共 API；
-- `openlinker.runtime` 运行 Agent Handler，使用 Agent Token 和双向 TLS 连接专用
+- `openlinker.runtime` 运行 Agent Handler，使用 Agent Token，按 discovery 指定的 token-only 或 mTLS 策略连接专用
   Runtime origin。
 
 Runtime 凭据不会经过平台 Client。SDK 只覆盖开源 Core 契约，不包含 Hosted 服务商品、
@@ -31,14 +31,14 @@ flowchart LR
   Client -->|"User Token / REST / SSE / A2A"| Core["openlinker-core"]
 
   Handler["Python Agent Handler"] --> Worker["openlinker.runtime.RuntimeWorker"]
-  Worker -->|"Agent Token + mTLS<br/>WebSocket 或长轮询"| Core
+  Worker -->|"Agent Token + discovery TLS 策略<br/>WebSocket 或长轮询"| Core
 
-  Adapter["openlinker-agent-node<br/>可选临时 Adapter"] --> GoWorker["openlinker-go Runtime Worker"]
+  Adapter["openlinker-agent-node<br/>可选桥接适配器"] --> GoWorker["openlinker-go Runtime Worker"]
   GoWorker --> Core
 ```
 
-Python 应用不需要 Agent Node。Agent Node 只是包在 Go SDK Worker 外、用于接入已有
-HTTP、命令、Codex 和 A2A backend 的临时 Adapter。
+Python 应用不需要 Agent Node。Agent Node 基于 Go SDK Worker 桥接已有 HTTP、命令、
+Codex、Claude 和 A2A backend，可以在用户侧长期运行。
 
 ## 从源码安装
 
@@ -269,6 +269,20 @@ tests/               # Client、Runtime、A2A、Webhook 与契约测试
 ```
 
 兼容范围和验证矩阵见 [PARITY.zh-CN.md](./PARITY.zh-CN.md)。
+
+## 委派结果与平台接口
+
+Worker 设置 `optional_features=[runtime.RUNTIME_DELEGATED_RUN_READ_FEATURE]` 后可申请
+委派结果读取。Handler 用 `context.can_read_delegated_runs` 检查当前任务能力，再以
+`await context.read_delegated_run(child_run_id)` 读取状态、输出和错误。运行中的子 Run 可在
+Handler 存活期间再次查询。请求只使用当前 Attempt 临时凭据；Core 验签并核对直接子 Run
+归属。旧任务或未实现该可选方法的自定义传输抛出 `RuntimeDelegationUnsupportedError`；
+Handler 返回或取消会终止进行中的读取。必需功能集和 contract digest 保持原值。
+
+平台 `Client.cancel_run(run_id)` 向 Core 请求取消，须继续检查 `cancel_state` 和后续 Run
+状态，不能把请求成功等同于运行已取消。`Client.recommend_task({"query": "研究资料"})`
+创建私有 Core Task 并返回 Agent 推荐，需要 `tasks:create` 权限；契约单独列于
+`contracts/core-tasks.v1.json`。
 
 ## 开发
 
