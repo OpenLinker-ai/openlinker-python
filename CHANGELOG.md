@@ -1,6 +1,11 @@
 # Changelog
 
-## SDK feature synchronization — Unreleased
+## v0.2.0 — 2026-10-04
+
+This GitHub source/distribution release does not imply publication to PyPI.
+Package metadata and the SDK agent identifier both use `0.2.0`.
+
+### SDK feature synchronization
 
 - Align the three SDKs on Core Run cancellation and private task recommendation
   contracts; keep task recommendation separate from the general client manifest.
@@ -15,7 +20,7 @@
   their retry behavior.
 - Correct token-only/mTLS, Agent Node and lifecycle documentation.
 
-## 0.2.0 — unreleased
+### Runtime compatibility
 
 This is a pre-1.0 breaking Runtime cutover.
 

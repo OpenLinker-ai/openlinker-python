@@ -9,8 +9,8 @@ Chinese documentation: [README.zh-CN.md](./README.zh-CN.md)
 
 ## Status
 
-This SDK is pre-1.0. Version `0.2.0` is unreleased and tracks the current Core
-API and Runtime contract. Pin a commit when evaluating it and review
+This SDK is pre-1.0. Version `0.2.0` tracks the current Core API and Runtime
+contract. Pin a release tag or reviewed commit and read
 [CHANGELOG.md](./CHANGELOG.md) before upgrading.
 
 The `openlinker` distribution is not published on PyPI yet. The install command
