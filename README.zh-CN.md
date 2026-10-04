@@ -8,8 +8,8 @@ English documentation: [README.md](./README.md)
 
 ## 状态
 
-本 SDK 处于 pre-1.0。`0.2.0` 尚未发布，跟随当前 Core API 和 Runtime 契约演进。
-评估时请固定 commit，升级前阅读 [CHANGELOG.md](./CHANGELOG.md)。
+本 SDK 处于 pre-1.0。`0.2.0` 跟随当前 Core API 和 Runtime 契约演进。
+请固定 release tag 或已审查的 commit，升级前阅读 [CHANGELOG.md](./CHANGELOG.md)。
 
 `openlinker` distribution 尚未发布到 PyPI。下方安装命令直接使用本仓库，不代表已经存在
 registry release。
