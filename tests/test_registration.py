@@ -680,6 +680,26 @@ def _alias_of(tmp_path, path):
     return alias / path.name
 
 
+def _dotdot_alias_of(tmp_path, path):
+    """``path`` as "<link>/../<name>", where link points into path's directory.
+
+    The file system resolves link before "..", so this names the same file
+    although a lexical normalization would not.
+    """
+    inner = path.parent / "inner"
+    inner.mkdir()
+    link = tmp_path / "link-dir"
+    try:
+        os.symlink(inner, link, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+    alias = link / ".." / path.name
+    canonical = registration_module._canonical_env_path
+    assert canonical(alias) == canonical(path)
+    assert os.path.abspath(alias) != os.path.abspath(path)
+    return alias
+
+
 def _save_concurrently(path) -> tuple[threading.Thread, list[BaseException]]:
     """Start another store instance's completed save and give it 0.2s to land.
 
@@ -787,13 +807,18 @@ async def test_pending_write_keeps_registration_another_start_completed_meanwhil
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("aliased", [False, True], ids=["same-path", "aliased-path"])
+@pytest.mark.parametrize("mode", ["same-path", "aliased-path", "dotdot-after-symlink"])
 async def test_concurrent_first_registrations_share_one_attempt(
-    tmp_path, clean_registration_env, aliased
+    tmp_path, clean_registration_env, mode
 ):
     path_a = tmp_path / "state" / ".env"
     path_a.parent.mkdir()
-    path_b = _alias_of(tmp_path, path_a) if aliased else path_a
+    if mode == "same-path":
+        path_b = path_a
+    elif mode == "aliased-path":
+        path_b = _alias_of(tmp_path, path_a)
+    else:
+        path_b = _dotdot_alias_of(tmp_path, path_a)
     core = ReplayCore()
     core.drop_after_commit = 1
     calls = 0
@@ -879,6 +904,86 @@ async def test_pending_record_directory_sync_errors(
     else:
         registration = await _ensure(core, request)
         assert registration.agent_token == "ol_agent_minted_1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="directory sync is skipped on Windows")
+async def test_persistent_directory_sync_error_never_redeems(
+    tmp_path, clean_registration_env, monkeypatch
+):
+    real_fsync = os.fsync
+    failing = True
+
+    def fsync(descriptor: int) -> None:
+        if failing and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    core = ReplayCore()
+
+    def request() -> EnsureAgentRequest:
+        return EnsureAgentRequest(
+            slug="demo-agent",
+            name="Demo Agent",
+            api_base=REPLAY_BASE,
+            user_token="ol_user_creator",
+            store=EnvRegistrationStore(tmp_path / ".env"),
+        )
+
+    # The first start fails after writing the record, the second before
+    # replaying it, and neither redeems.
+    for _ in range(2):
+        with pytest.raises(OSError) as raised:
+            await _ensure(core, request())
+        assert raised.value.errno == errno.EIO
+    assert core.create_token_calls == 1
+    assert core.register_tokens == []
+
+    # Once the directory syncs, the recorded token is redeemed.
+    failing = False
+    registration = await _ensure(core, request())
+    assert registration.agent_token == "ol_agent_minted_1"
+    assert core.create_token_calls == 1
+    assert core.register_tokens == ["ol_agent_minted_1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_top", [False, True], ids=["synced", "failed-top-sync"])
+async def test_pending_write_syncs_parents_of_created_directories(
+    tmp_path, clean_registration_env, monkeypatch, fail_top
+):
+    path = tmp_path / "a" / "b" / ".env"
+    original = registration_module._fsync_directory
+    synced: list[str] = []
+
+    def record(directory) -> None:
+        synced.append(str(directory))
+        if fail_top and str(directory) == str(tmp_path):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        original(directory)
+
+    monkeypatch.setattr(registration_module, "_fsync_directory", record)
+    core = ReplayCore()
+    request = EnsureAgentRequest(
+        slug="demo-agent",
+        name="Demo Agent",
+        api_base=REPLAY_BASE,
+        user_token="ol_user_creator",
+        store=EnvRegistrationStore(path),
+    )
+    if fail_top:
+        # The parent sync runs before the record is written, so a failure
+        # leaves nothing to replay and nothing is redeemed.
+        with pytest.raises(OSError) as raised:
+            await _ensure(core, request)
+        assert raised.value.errno == errno.EIO
+        assert not path.exists()
+        assert core.register_tokens == []
+        return
+    registration = await _ensure(core, request)
+    assert registration.agent_token == "ol_agent_minted_1"
+    assert synced[:3] == [str(tmp_path), str(tmp_path / "a"), str(tmp_path / "a" / "b")]
 
 
 @pytest.mark.asyncio

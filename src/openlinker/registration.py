@@ -69,15 +69,18 @@ _ENV_PATH_LOCKS_GUARD = threading.Lock()
 def _canonical_env_path(path: Path | str) -> str:
     """Name one env file however it is reached.
 
-    The absolute path with its existing ancestor directories resolved through
-    symlinks (for example /tmp/x.env and /private/tmp/x.env on macOS); a
-    missing tail is kept as written, so the name stays stable when the parent
-    directory is created later.
+    The directory part has its existing ancestors resolved through symlinks
+    (for example /tmp/x.env and /private/tmp/x.env on macOS); a missing tail is
+    kept as written, so the name stays stable when the parent directory is
+    created later. Symlinks are resolved before any lexical normalization,
+    because the file system reads "link/.." as the parent of link's target and
+    ``os.path.abspath`` would collapse it first and name another file.
     """
-    absolute = os.path.abspath(path)
-    return os.path.join(
-        os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute)
-    )
+    raw = os.fspath(path)
+    if not os.path.isabs(raw):
+        raw = os.path.join(os.getcwd(), raw)
+    directory, name = os.path.split(raw)
+    return os.path.join(os.path.realpath(directory), name)
 
 
 def _env_path_lock(path: Path) -> threading.Lock:
@@ -262,7 +265,7 @@ class EnvRegistrationStore:
             if key in _PENDING_REQUEST_FIELDS
         }
         with self._lock, _env_path_lock(self.path):
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _make_pending_directory(self.path.parent)
             for _ in range(_PENDING_REGISTRATION_WRITE_ATTEMPTS):
                 before = _read_env_bytes(self.path)
                 content = before.decode("utf-8") if before is not None else ""
@@ -601,6 +604,10 @@ async def _redeem_new_registration(
         if previous is not None and _pending_registration_matches(
             previous, api_base, request, mint
         ):
+            # An earlier start may have written this record and then failed to
+            # sync its directory, so confirm it is durable before Core is asked
+            # to redeem it.
+            _fsync_directory(journal.path.parent)
             previous.request.endpoint_auth_header = request.endpoint_auth_header
             try:
                 return await _redeem_pending_registration(sdk, store, req, journal, previous)
@@ -1014,6 +1021,25 @@ def _fsync_directory(directory: Path) -> None:
             raise
     finally:
         os.close(descriptor)
+
+
+def _make_pending_directory(directory: Path) -> None:
+    """Create ``directory`` as ``mkdir -p`` does, then sync each created parent.
+
+    The parent of every directory it created is synced top down, so the
+    record's path is durable before the token is redeemed. It runs before the
+    record is written, so a failed sync leaves no record behind.
+    """
+    missing: list[Path] = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for created in reversed(missing):
+        _fsync_directory(created.parent)
 
 
 def _replace_env_file(
