@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -64,11 +66,57 @@ _ENV_PATH_LOCKS: dict[str, threading.Lock] = {}
 _ENV_PATH_LOCKS_GUARD = threading.Lock()
 
 
+def _canonical_env_path(path: Path | str) -> str:
+    """Name one env file however it is reached.
+
+    The absolute path with its existing ancestor directories resolved through
+    symlinks (for example /tmp/x.env and /private/tmp/x.env on macOS); a
+    missing tail is kept as written, so the name stays stable when the parent
+    directory is created later.
+    """
+    absolute = os.path.abspath(path)
+    return os.path.join(
+        os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute)
+    )
+
+
 def _env_path_lock(path: Path) -> threading.Lock:
     """The lock for ``path``; callers take their store's own lock first."""
-    key = os.path.abspath(path)
+    key = _canonical_env_path(path)
     with _ENV_PATH_LOCKS_GUARD:
         return _ENV_PATH_LOCKS.setdefault(key, threading.Lock())
+
+
+# One lock per canonical env file path. It serializes a whole first
+# registration in this process: loading the stored registration and the
+# record, choosing, minting, writing the record, redeeming, and saving or
+# cleaning up. A second start for the same file waits, then reuses the
+# completed registration or replays the matching record. It is taken before
+# any store or path lock and is the only lock held across network calls.
+# Processes are not coordinated, as before.
+_FIRST_REGISTRATION_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _first_registration_lock(store: RegistrationStore) -> threading.Lock | None:
+    """The first-registration lock of an EnvRegistrationStore; other stores get none."""
+    journal = _pending_journal(store)
+    if journal is None:
+        return None
+    key = _canonical_env_path(journal.path)
+    with _ENV_PATH_LOCKS_GUARD:
+        return _FIRST_REGISTRATION_LOCKS.setdefault(key, threading.Lock())
+
+
+async def _acquire_without_blocking_loop(lock: threading.Lock) -> None:
+    """Wait for ``lock`` without blocking the event loop.
+
+    The holder may be a task on this loop that is awaiting the network, so a
+    blocking acquire could deadlock; other threads' loops are served too.
+    """
+    delay = 0.005
+    while not lock.acquire(blocking=False):
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 0.05)
 
 
 def _run_pending_test_hook(stage: str) -> None:
@@ -357,7 +405,35 @@ async def ensure_agent(
         raise ValueError(f"openlinker: unsupported registration policy {req.policy!r}")
 
     store = req.store or EnvRegistrationStore(req.env_path)
+    lock = _first_registration_lock(store)
+    if lock is None:
+        return await _ensure_agent_with_store(req, store, client, lambda: None)
+    await _acquire_without_blocking_loop(lock)
+    held = True
+
+    def release() -> None:
+        nonlocal held
+        if held:
+            held = False
+            lock.release()
+
+    try:
+        return await _ensure_agent_with_store(req, store, client, release)
+    finally:
+        release()
+
+
+async def _ensure_agent_with_store(
+    req: EnsureAgentRequest,
+    store: RegistrationStore,
+    client: Client | None,
+    release_first_registration_lock: Callable[[], None],
+) -> AgentRegistration:
     stored = store.load_agent_registration()
+    # A completed registration is reused, validated or rotated as before,
+    # without holding the first-registration lock.
+    if stored is not None:
+        release_first_registration_lock()
     req.user_token = _first(req.user_token, os.getenv("OPENLINKER_USER_TOKEN"))
     req.agent_token = _first(
         req.agent_token,
@@ -905,21 +981,37 @@ def _read_env_bytes(path: Path) -> bytes | None:
         return None
 
 
+_UNSUPPORTED_DIRECTORY_SYNC = {
+    code
+    for code in (
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if code is not None
+}
+
+
 def _fsync_directory(directory: Path) -> None:
     """Flush a directory's entries so a replace or unlink inside it is durable.
 
-    Best effort: platforms that cannot sync a directory, such as Windows, skip it.
+    Platforms or file systems that cannot sync a directory (Windows, or EINVAL,
+    ENOTSUP and EOPNOTSUPP) skip it; any other error is raised, so a record
+    write fails before the token is redeemed.
     """
     if os.name == "nt":
         return
     try:
         descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
-        return
+    except OSError as error:
+        if error.errno in _UNSUPPORTED_DIRECTORY_SYNC:
+            return
+        raise
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
+    except OSError as error:
+        if error.errno not in _UNSUPPORTED_DIRECTORY_SYNC:
+            raise
     finally:
         os.close(descriptor)
 

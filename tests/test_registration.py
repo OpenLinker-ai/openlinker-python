@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -668,6 +670,16 @@ def _write_as_other_process(path) -> None:
     path.write_text(existing + _COMPLETED_ELSEWHERE_ENV, encoding="utf-8")
 
 
+def _alias_of(tmp_path, path):
+    """``path`` reached through a symlinked directory: the same file under another name."""
+    alias = tmp_path / "alias-dir"
+    try:
+        os.symlink(path.parent, alias, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+    return alias / path.name
+
+
 def _save_concurrently(path) -> tuple[threading.Thread, list[BaseException]]:
     """Start another store instance's completed save and give it 0.2s to land.
 
@@ -724,17 +736,19 @@ async def test_pending_cleanup_keeps_completed_registration_written_meanwhile(
         path.write_text(existing, encoding="utf-8")
     core = ReplayCore()
     core.slugs.add("taken-agent")
+    alias = _alias_of(tmp_path, path)
     saved = None
 
     def hook(stage: str) -> None:
         # Another writer completes a registration after this attempt compared
         # its record: another process before the guarding re-read, or another
-        # store instance just before the unlink or replace.
+        # store instance (reaching the file through a symlinked directory) just
+        # before the unlink or replace.
         nonlocal saved
         if not same_process and stage == "cleanup.reread":
             _write_as_other_process(path)
         elif same_process and stage == "cleanup.mutate" and saved is None:
-            saved = _save_concurrently(path)
+            saved = _save_concurrently(alias)
 
     monkeypatch.setattr(registration_module, "_pending_test_hook", hook)
     await _ensure_taken(core, path)
@@ -750,6 +764,7 @@ async def test_pending_write_keeps_registration_another_start_completed_meanwhil
     path = tmp_path / ".env"
     core = ReplayCore()
     core.slugs.add("taken-agent")
+    alias = _alias_of(tmp_path, path)
     saved = None
     wrote = False
 
@@ -762,13 +777,108 @@ async def test_pending_write_keeps_registration_another_start_completed_meanwhil
             wrote = True
             _write_as_other_process(path)
         elif same_process and stage == "write.rename" and saved is None:
-            saved = _save_concurrently(path)
+            saved = _save_concurrently(alias)
 
     monkeypatch.setattr(registration_module, "_pending_test_hook", hook)
     await _ensure_taken(core, path)
     assert not same_process or saved is not None
     _assert_completed_elsewhere_survived(path, "", saved)
     assert _read_pending(path) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("aliased", [False, True], ids=["same-path", "aliased-path"])
+async def test_concurrent_first_registrations_share_one_attempt(
+    tmp_path, clean_registration_env, aliased
+):
+    path_a = tmp_path / "state" / ".env"
+    path_a.parent.mkdir()
+    path_b = _alias_of(tmp_path, path_a) if aliased else path_a
+    core = ReplayCore()
+    core.drop_after_commit = 1
+    calls = 0
+    task_b: asyncio.Task | None = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls, task_b
+        calls += 1
+        if task_b is None and request.url.path == "/api/v1/creator/agent-tokens":
+            # Start B while A is minting. Without the first-registration lock B
+            # would read the empty record, mint a second token and reach Core.
+            task_b = asyncio.create_task(start(path_b))
+            for _ in range(40):
+                if calls >= 2:
+                    break
+                await asyncio.sleep(0.005)
+        return await core.handler(request)
+
+    async def start(path) -> AgentRegistration:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = Client(REPLAY_BASE, http_client=http_client, user_token="ol_user_creator")
+            return await ensure_agent(
+                EnsureAgentRequest(
+                    slug="demo-agent",
+                    name="Demo Agent",
+                    api_base=REPLAY_BASE,
+                    store=EnvRegistrationStore(path),
+                ),
+                client=client,
+            )
+
+    # A's redemption commits but its response is lost.
+    with pytest.raises(httpx.ConnectError):
+        await start(path_a)
+    assert task_b is not None
+    registration_b = await task_b
+    # B replays A's recorded token, so nothing is orphaned.
+    assert registration_b.agent_token == "ol_agent_minted_1"
+    assert core.create_token_calls == 1
+    assert core.register_tokens == ["ol_agent_minted_1", "ol_agent_minted_1"]
+    stored = EnvRegistrationStore(path_a).load_agent_registration()
+    assert stored is not None
+    assert stored.agent_token == "ol_agent_minted_1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="directory sync is skipped on Windows")
+@pytest.mark.parametrize(
+    ("code", "fails"),
+    [
+        pytest.param(errno.EIO, True, id="EIO"),
+        pytest.param(errno.EINVAL, False, id="EINVAL"),
+        pytest.param(getattr(errno, "ENOTSUP", errno.EOPNOTSUPP), False, id="ENOTSUP"),
+        pytest.param(errno.EOPNOTSUPP, False, id="EOPNOTSUPP"),
+    ],
+)
+async def test_pending_record_directory_sync_errors(
+    tmp_path, clean_registration_env, monkeypatch, code, fails
+):
+    real_fsync = os.fsync
+
+    def fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(code, os.strerror(code))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    core = ReplayCore()
+    request = EnsureAgentRequest(
+        slug="demo-agent",
+        name="Demo Agent",
+        api_base=REPLAY_BASE,
+        user_token="ol_user_creator",
+        store=EnvRegistrationStore(tmp_path / ".env"),
+    )
+    if fails:
+        # A genuine I/O error fails the start before the token is redeemed.
+        with pytest.raises(OSError) as raised:
+            await _ensure(core, request)
+        assert raised.value.errno == errno.EIO
+        assert core.create_token_calls == 1
+        assert core.register_tokens == []
+    else:
+        registration = await _ensure(core, request)
+        assert registration.agent_token == "ol_agent_minted_1"
 
 
 @pytest.mark.asyncio
