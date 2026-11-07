@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import sys
+import threading
 from dataclasses import replace
 
 import httpx
@@ -528,47 +529,6 @@ async def test_ensure_agent_never_replays_mismatched_pending_record(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("existing", ["", "UNRELATED=value\n"], ids=["created-file", "other-lines"])
-async def test_pending_cleanup_keeps_completed_registration_written_after_comparison(
-    tmp_path, clean_registration_env, monkeypatch, existing
-):
-    path = tmp_path / ".env"
-    if existing:
-        path.write_text(existing, encoding="utf-8")
-    core = ReplayCore()
-    core.slugs.add("taken-agent")
-    completed = AgentRegistration(
-        agent_id="agent-elsewhere",
-        agent_slug="other-agent",
-        agent_token="ol_agent_completed_elsewhere",
-        api_base=REPLAY_BASE,
-    )
-
-    def complete_elsewhere() -> None:
-        # Another store instance completes a registration after this attempt
-        # compared the record but before it removes it.
-        EnvRegistrationStore(path).save_agent_registration(completed)
-
-    monkeypatch.setattr(registration_module, "_before_pending_cleanup", complete_elsewhere)
-    with pytest.raises(OpenLinkerError) as raised:
-        await _ensure(
-            core,
-            EnsureAgentRequest(
-                slug="taken-agent",
-                name="Taken Agent",
-                api_base=REPLAY_BASE,
-                user_token="ol_user_creator",
-                store=EnvRegistrationStore(path),
-            ),
-        )
-    assert raised.value.status_code == 409
-    loaded = EnvRegistrationStore(path).load_agent_registration()
-    assert loaded is not None
-    assert loaded.agent_token == "ol_agent_completed_elsewhere"
-    assert path.read_text(encoding="utf-8").startswith(existing)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("headers", "recorded_credential"),
     [
@@ -690,30 +650,55 @@ async def test_refused_attempt_keeps_record_written_by_another_attempt(
     assert _read_pending(path)["agent_token"] == "ol_agent_concurrent_a"
 
 
-@pytest.mark.asyncio
-async def test_pending_write_keeps_registration_another_start_completed_meanwhile(
-    tmp_path, clean_registration_env, monkeypatch
-):
-    path = tmp_path / ".env"
-    core = ReplayCore()
-    core.slugs.add("taken-agent")
-    completed_a = AgentRegistration(
-        agent_id="agent-a",
-        agent_slug="agent-a",
-        agent_token="ol_agent_completed_a",
-        api_base=REPLAY_BASE,
-    )
-    calls = 0
+_COMPLETED_ELSEWHERE_ENV = (
+    'OPENLINKER_AGENT_ID="agent-elsewhere"\n'
+    'OPENLINKER_AGENT_TOKEN="ol_agent_completed_elsewhere"\n'
+)
+_COMPLETED_ELSEWHERE = AgentRegistration(
+    agent_id="agent-elsewhere",
+    agent_slug="other-agent",
+    agent_token="ol_agent_completed_elsewhere",
+    api_base=REPLAY_BASE,
+)
 
-    def complete_a() -> None:
-        # Start A saves its completed registration through its own store while
-        # start B's record write is between its read and its replace.
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            EnvRegistrationStore(path).save_agent_registration(completed_a)
 
-    monkeypatch.setattr(registration_module, "_before_pending_write", complete_a)
+def _write_as_other_process(path) -> None:
+    """Append a completed registration directly, as another process would."""
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    path.write_text(existing + _COMPLETED_ELSEWHERE_ENV, encoding="utf-8")
+
+
+def _save_concurrently(path) -> tuple[threading.Thread, list[BaseException]]:
+    """Start another store instance's completed save and give it 0.2s to land.
+
+    While the caller holds the path lock it cannot.
+    """
+    errors: list[BaseException] = []
+
+    def save() -> None:
+        try:
+            EnvRegistrationStore(path).save_agent_registration(_COMPLETED_ELSEWHERE)
+        except BaseException as error:  # noqa: BLE001 - reported by the test
+            errors.append(error)
+
+    thread = threading.Thread(target=save)
+    thread.start()
+    thread.join(timeout=0.2)
+    return thread, errors
+
+
+def _assert_completed_elsewhere_survived(path, existing: str, saved) -> None:
+    if saved is not None:
+        thread, errors = saved
+        thread.join()
+        assert errors == []
+    loaded = EnvRegistrationStore(path).load_agent_registration()
+    assert loaded is not None
+    assert loaded.agent_token == "ol_agent_completed_elsewhere"
+    assert path.read_text(encoding="utf-8").startswith(existing)
+
+
+async def _ensure_taken(core: ReplayCore, path) -> None:
     with pytest.raises(OpenLinkerError) as raised:
         await _ensure(
             core,
@@ -726,9 +711,63 @@ async def test_pending_write_keeps_registration_another_start_completed_meanwhil
             ),
         )
     assert raised.value.status_code == 409
-    loaded = EnvRegistrationStore(path).load_agent_registration()
-    assert loaded is not None
-    assert loaded.agent_token == "ol_agent_completed_a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing", ["", "UNRELATED=value\n"], ids=["created-file", "other-lines"])
+@pytest.mark.parametrize("same_process", [False, True], ids=["other-process", "other-store"])
+async def test_pending_cleanup_keeps_completed_registration_written_meanwhile(
+    tmp_path, clean_registration_env, monkeypatch, existing, same_process
+):
+    path = tmp_path / ".env"
+    if existing:
+        path.write_text(existing, encoding="utf-8")
+    core = ReplayCore()
+    core.slugs.add("taken-agent")
+    saved = None
+
+    def hook(stage: str) -> None:
+        # Another writer completes a registration after this attempt compared
+        # its record: another process before the guarding re-read, or another
+        # store instance just before the unlink or replace.
+        nonlocal saved
+        if not same_process and stage == "cleanup.reread":
+            _write_as_other_process(path)
+        elif same_process and stage == "cleanup.mutate" and saved is None:
+            saved = _save_concurrently(path)
+
+    monkeypatch.setattr(registration_module, "_pending_test_hook", hook)
+    await _ensure_taken(core, path)
+    assert not same_process or saved is not None
+    _assert_completed_elsewhere_survived(path, existing, saved)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_process", [False, True], ids=["other-process", "other-store"])
+async def test_pending_write_keeps_registration_another_start_completed_meanwhile(
+    tmp_path, clean_registration_env, monkeypatch, same_process
+):
+    path = tmp_path / ".env"
+    core = ReplayCore()
+    core.slugs.add("taken-agent")
+    saved = None
+    wrote = False
+
+    def hook(stage: str) -> None:
+        # Start A completes while start B's record write is in flight: another
+        # process before B's guarding re-read, or another store instance just
+        # before B's replace.
+        nonlocal saved, wrote
+        if not same_process and stage == "write.reread" and not wrote:
+            wrote = True
+            _write_as_other_process(path)
+        elif same_process and stage == "write.rename" and saved is None:
+            saved = _save_concurrently(path)
+
+    monkeypatch.setattr(registration_module, "_pending_test_hook", hook)
+    await _ensure_taken(core, path)
+    assert not same_process or saved is not None
+    _assert_completed_elsewhere_survived(path, "", saved)
     assert _read_pending(path) is None
 
 
@@ -740,13 +779,15 @@ async def test_contended_pending_write_is_given_up_and_start_continues(
     core = ReplayCore()
     writes = 0
 
-    def other_writer() -> None:
-        # Another writer changes the file before every guarding re-read.
+    def other_writer(stage: str) -> None:
+        # Another process changes the file before every guarding re-read.
         nonlocal writes
+        if stage != "write.reread":
+            return
         writes += 1
         path.write_text(f"OTHER_WRITER={writes}\n", encoding="utf-8")
 
-    monkeypatch.setattr(registration_module, "_before_pending_write", other_writer)
+    monkeypatch.setattr(registration_module, "_pending_test_hook", other_writer)
     registration = await _ensure(
         core,
         EnsureAgentRequest(
@@ -762,6 +803,59 @@ async def test_contended_pending_write_is_given_up_and_start_continues(
     raw = path.read_text(encoding="utf-8")
     assert _read_pending(path) is None
     assert raw.startswith("OTHER_WRITER=3\n")
+
+
+class _MintCredentialAuth(httpx.Auth):
+    """Sends another creator's credential on mint requests only."""
+
+    def auth_flow(self, request: httpx.Request):
+        if request.url.path == "/api/v1/creator/agent-tokens":
+            request.headers["Authorization"] = "Bearer ol_user_from_auth"
+        yield request
+
+
+async def _observe_request(request: httpx.Request) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client_options",
+    [
+        pytest.param({"auth": _MintCredentialAuth()}, id="httpx-auth"),
+        pytest.param({"event_hooks": {"request": [_observe_request]}}, id="request-hook"),
+    ],
+)
+async def test_unknowable_minting_credential_writes_no_record(
+    tmp_path, clean_registration_env, client_options
+):
+    path = tmp_path / ".env"
+    core = ReplayCore()
+    core.fail_register_transiently = 1
+
+    async def start() -> AgentRegistration:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(core.handler), **client_options
+        ) as http_client:
+            client = Client(REPLAY_BASE, http_client=http_client, user_token="ol_user_creator")
+            return await ensure_agent(
+                EnsureAgentRequest(
+                    slug="demo-agent",
+                    name="Demo Agent",
+                    api_base=REPLAY_BASE,
+                    store=EnvRegistrationStore(path),
+                ),
+                client=client,
+            )
+
+    # The redemption fails before Core sees it; with an unknowable creator
+    # credential no record is written, so the restart mints as before.
+    with pytest.raises(httpx.ConnectError):
+        await start()
+    assert not path.exists()
+    registration = await start()
+    assert registration.agent_token == "ol_agent_minted_2"
+    assert core.create_token_calls == 2
 
 
 @pytest.mark.asyncio
